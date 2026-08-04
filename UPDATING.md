@@ -24,6 +24,42 @@ assists people when migrating to a new version.
 
 ## Next
 
+### Queries naming a CTE after a table they also read may now be rejected
+
+`extract_tables_from_statement()` decided whether a reference was a CTE by matching its
+bare name against the enclosing scope's CTE names; it now resolves the name through
+`Scope.cte_sources`. Three kinds of real table read were mistaken for a CTE reference and
+dropped from the statement's table set, so they received neither a row-level security
+predicate nor an access check — a qualified reference, a non-recursive CTE's own name
+inside its body, and a forward reference in a non-recursive `WITH`:
+
+```sql
+WITH orders AS (SELECT 1 AS d) SELECT * FROM (SELECT * FROM public.orders) AS z
+WITH orders AS (SELECT * FROM orders) SELECT * FROM orders
+WITH q1 AS (SELECT key FROM q2), q2 AS (SELECT 1 AS key) SELECT * FROM q1
+```
+
+More tables are reported, so such a query may be rejected where it previously ran: the
+read is filtered when `RLS_IN_SQLLAB` is enabled, matched against
+`DISALLOWED_SQL_TABLES` (which includes `information_schema` by default), and requires
+dataset access under `raise_for_access(force_dataset_match=True)`, which SQL Lab uses.
+Rename the CTE so it differs from the tables the query reads to restore the previous
+behaviour. A `WITH RECURSIVE` item's reference to itself or to a later item is also
+reported as a table, which is legal SQL and the same fail-closed direction.
+
+### Row-level security no longer applies to a CTE reference sharing a rule's table name
+
+A common table expression whose name matched a table an RLS rule is registered under was
+treated as a read of that table, and the rule's predicate was applied to the CTE's
+projection. Where that projection lacks the column the rule names, the rewritten query
+failed to execute; where it happens to have that column, rows of whatever the CTE reads
+were filtered by a rule that was never about them. Only real table reads are filtered.
+
+A query whose CTE reads the table it is named after still gets the predicate, once, on
+the read inside the CTE body. A query whose CTE reads something else loses a filter that
+was never meant for it, so row counts may rise — register a rule on the table the CTE
+actually reads to filter it deliberately.
+
 ### Principal listing APIs now honour related-field filters
 
 Two authorization-related listing behaviors changed for API clients. Neither
