@@ -41,24 +41,12 @@ WITH q1 AS (SELECT key FROM q2), q2 AS (SELECT 1 AS key) SELECT * FROM q1
 
 More tables are reported, so such a query may be rejected where it previously ran: the
 read is filtered when `RLS_IN_SQLLAB` is enabled, matched against
-`DISALLOWED_SQL_TABLES` (which includes `information_schema` by default), and requires
+`DISALLOWED_SQL_TABLES` (which covers `information_schema` views for
+several engines by default), and requires
 dataset access under `raise_for_access(force_dataset_match=True)`, which SQL Lab uses.
 Rename the CTE so it differs from the tables the query reads to restore the previous
-behaviour. A `WITH RECURSIVE` item's reference to itself or to a later item is also
-reported as a table, which is legal SQL and the same fail-closed direction.
-
-### Row-level security no longer applies to a CTE reference sharing a rule's table name
-
-A common table expression whose name matched a table an RLS rule is registered under was
-treated as a read of that table, and the rule's predicate was applied to the CTE's
-projection. Where that projection lacks the column the rule names, the rewritten query
-failed to execute; where it happens to have that column, rows of whatever the CTE reads
-were filtered by a rule that was never about them. Only real table reads are filtered.
-
-A query whose CTE reads the table it is named after still gets the predicate, once, on
-the read inside the CTE body. A query whose CTE reads something else loses a filter that
-was never meant for it, so row counts may rise — register a rule on the table the CTE
-actually reads to filter it deliberately.
+behavior. A `WITH RECURSIVE` item's reference to itself or to a later item is also
+reported as a table, which is legal SQL, and errs toward an extra access check rather than a missing one.
 
 ### Table aliases keep their quoting through the row-level security rewrite
 

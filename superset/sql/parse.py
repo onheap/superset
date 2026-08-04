@@ -248,25 +248,15 @@ class RLSTransformer:
         catalog: str | None,
         schema: str | None,
         rules: dict[Table, list[exp.Expression]],
-        cte_references: frozenset[int],
     ) -> None:
         self.catalog = catalog
         self.schema = schema
         self.rules = rules
-        self.cte_references = cte_references
 
     def get_predicate(self, table_node: exp.Table) -> exp.Expression | None:
         """
         Get the combined RLS predicate for a table.
         """
-        # A CTE reference is an ``exp.Table`` too, and it carries the CTE's name --
-        # which may be the name a rule is registered under. Filtering it would apply
-        # that rule to the CTE's projection, which need not have the column the rule
-        # names, so the rewritten statement fails to resolve. Only a table read is
-        # filtered here, and ``cte_references`` says which nodes are not one.
-        if id(table_node) in self.cte_references:
-            return None
-
         table = Table(
             table_node.name,
             table_node.db if table_node.db else self.schema,
@@ -1420,19 +1410,8 @@ class SQLStatement(BaseSQLStatement[exp.Expression]):
         if method not in transformers:
             raise ValueError(f"Invalid RLS method: {method}")
 
-        # Resolve which references are CTEs on the same tree the transformer will walk.
-        # ``transform()`` copies internally and a copy holds different node objects, so
-        # identities resolved on the original would match nothing. Copying here first
-        # and transforming that copy in place costs the same and leaves the two steps
-        # looking at one tree.
-        parsed = self._parsed.copy()
-        transformer = transformers[method](
-            catalog,
-            schema,
-            predicates,
-            _cte_reference_ids(parsed),
-        )
-        self._parsed = parsed.transform(transformer, copy=False)
+        transformer = transformers[method](catalog, schema, predicates)
+        self._parsed = self._parsed.transform(transformer)
 
 
 class KQLSplitState(enum.Enum):
@@ -2032,70 +2011,30 @@ def is_cte(source: exp.Table, scope: Scope) -> bool:
     """
     Does this reference resolve to a CTE rather than to a table?
 
-    A CTE reference is represented by an ``exp.Table`` -- including a *pivoted* one,
-    since pivoting yields a new relation -- so it has to be excluded from the tables a
+    A CTE reference is an ``exp.Table`` too, so it has to be excluded from the tables a
     statement reads; otherwise a user with access to table `foo` could reach any table
     with a query like this:
 
         WITH foo AS (SELECT * FROM target_table) SELECT * FROM foo
 
-    The answer comes from ``Scope.cte_sources``, which maps each CTE's *name* to its
-    scope. Not from ``Scope.sources``: that is keyed by ``alias_or_name``, so it files
-    an aliased CTE reference under the alias, and a real table sharing that alias would
-    be taken for the CTE and dropped.
+    The name is resolved through ``Scope.cte_sources`` rather than compared, because it
+    can match a CTE while the reference still resolves to a table: a qualified reference
+    cannot name a CTE, and nor can a ``WITH`` item's reference to itself or to a later
+    item unless ``RECURSIVE`` makes it legal. ``Scope.sources`` will not serve — keyed
+    by ``alias_or_name``, it files an aliased CTE reference under the alias, so a real
+    table sharing that alias would be taken for the CTE and dropped.
 
-    The name is resolved rather than compared because a name can match a CTE while the
-    reference still resolves to a table: a qualified reference cannot name a CTE, and
-    nor can a ``WITH`` item's reference to itself or to a later item, unless
-    ``RECURSIVE`` makes it legal.
-
-    Over-reports where sqlglot does not register a name it should: a reference differing
-    from the CTE in letter case, and a ``WITH RECURSIVE`` item's legal reference to
-    itself or to a later item outside a set-operation body. Both cost a spurious access
-    check rather than a missing one.
+    Where sqlglot registers a name differently than SQL scopes it, this errs toward
+    reporting a table — a spurious access check rather than a missing one — for a
+    reference differing from the CTE in letter case, and for a ``WITH RECURSIVE``
+    item's reference to itself or to a later item. A read in a recursive item's base
+    term is the exception: it is not reported.
     """
     if source.db or source.catalog:
         return False
 
     resolved = scope.cte_sources.get(source.name)
-    if not (isinstance(resolved, Scope) and resolved.scope_type == ScopeType.CTE):
-        return False
-
-    # A recursive CTE's own name is registered for the whole of its body, but only the
-    # recursive term may use it: the base term is evaluated before the CTE exists, so a
-    # reference there is the table of that name. sqlglot resolves the name to a scope
-    # over the base term, which makes "the reference sits inside the scope it resolved
-    # to" exactly that case.
-    ancestor = source.parent
-    while ancestor is not None:
-        if ancestor is resolved.expression:
-            return False
-        ancestor = ancestor.parent
-
-    return True
-
-
-def _cte_reference_ids(statement: exp.Expression) -> frozenset[int]:
-    """
-    Identify the ``exp.Table`` nodes of a statement that are CTE references.
-
-    Reported as ``id()`` values, not as the nodes themselves, because
-    ``exp.Expression`` compares and hashes structurally: two occurrences of one name are
-    a single element of a set of nodes, and one of them may be a CTE reference while the
-    other is a table read. The ids are valid for as long as the caller holds
-    ``statement``, which is what keeps the nodes alive.
-
-    A table outside every scope is not reported -- the target of ``DESCRIBE``, of
-    ``UPDATE`` or ``DELETE``, and of ``INSERT INTO ... SELECT``, none of which
-    ``Scope.tables`` covers. That is the safe direction, since this set is only ever
-    used to leave a node alone.
-    """
-    return frozenset(
-        id(table)
-        for scope in traverse_scope(statement)
-        for table in scope.tables
-        if is_cte(table, scope)
-    )
+    return isinstance(resolved, Scope) and resolved.scope_type == ScopeType.CTE
 
 
 T = TypeVar("T", str, None)

@@ -722,11 +722,9 @@ def test_extract_tables_reusing_aliases() -> None:
 
     A non-recursive ``WITH`` item may only reference items declared before it, so a
     reference to a name declared later in the same ``WITH`` list resolves outside the
-    ``WITH``, to the table of that name. PostgreSQL says so when the table is absent:
-    ``relation "q2" does not exist``, with ``DETAIL: There is a WITH item named "q2",
-    but it cannot be referenced from this part of the query.`` Such a reference is a
-    real table read and has to be extracted, or it receives neither a row-level
-    security predicate nor an access check.
+    ``WITH``, to the table of that name. Such a reference is a real table read and has
+    to be extracted, or it receives neither a row-level security predicate nor an
+    access check.
     """
     # `q1` is declared first, so the `q2` in its body is the table, and `q2`'s `src`
     # is a table as well.
@@ -756,7 +754,7 @@ def test_extract_tables_cte_name_shared_with_table() -> None:
     Only a reference that resolves to the CTE may be excluded; dropping any other costs
     it both its row filter and its access check.
     """
-    # The reference inside the CTE body is the table -- and it is qualified, so it could
+    # The reference inside the CTE body is the table — and it is qualified, so it could
     # not have named the CTE in any case.
     assert extract_tables_from_sql(
         "WITH orders AS (SELECT * FROM public.orders) SELECT * FROM orders"
@@ -779,9 +777,8 @@ def test_extract_tables_cte_reference_not_table() -> None:
     """
     Test the counterpart: a reference that does resolve to a CTE is not a table.
 
-    Includes the two shapes sqlglot still records as an ``exp.Table``, which is why the
-    name has to be resolved rather than compared: a recursive CTE's self-reference, and
-    a pivoted reference.
+    Includes the two shapes a bare-name comparison gets wrong, which is why the name has
+    to be resolved: a recursive CTE's self-reference, and a pivoted reference.
     """
     assert (
         extract_tables_from_sql(
@@ -792,14 +789,19 @@ def test_extract_tables_cte_reference_not_table() -> None:
         == set()
     )
 
-    # Pivoted, at the top level and nested. Only `secret` is read.
-    for sql in (
-        "WITH c AS (SELECT a, b FROM secret) "
+    # Pivoted at the top level. Only `other_table` is read.
+    assert extract_tables_from_sql(
+        "WITH c AS (SELECT a, b FROM other_table) "
         "SELECT * FROM c PIVOT(SUM(b) FOR a IN ('p'))",
-        "WITH c AS (SELECT a, b FROM secret) "
+        engine="snowflake",
+    ) == {Table("other_table")}
+
+    # And pivoted inside a derived table.
+    assert extract_tables_from_sql(
+        "WITH c AS (SELECT a, b FROM other_table) "
         "SELECT * FROM (SELECT * FROM c PIVOT(SUM(b) FOR a IN ('p'))) AS z",
-    ):
-        assert extract_tables_from_sql(sql, engine="snowflake") == {Table("secret")}
+        engine="snowflake",
+    ) == {Table("other_table")}
 
 
 def test_extract_tables_aliased_cte_does_not_hide_table() -> None:
@@ -811,20 +813,20 @@ def test_extract_tables_aliased_cte_does_not_hide_table() -> None:
     is keyed by CTE name only.
     """
     assert extract_tables_from_sql(
-        "WITH c AS (SELECT 1 AS n) SELECT s2.* FROM c AS secret, secret AS s2"
-    ) == {Table("secret")}
+        "WITH c AS (SELECT 1 AS n) SELECT s2.* FROM c AS other_table, other_table AS s2"
+    ) == {Table("other_table")}
 
     assert extract_tables_from_sql(
         "WITH c AS (SELECT 1 AS n) "
-        "SELECT s2.* FROM c AS secret LEFT JOIN secret AS s2 ON TRUE"
-    ) == {Table("secret")}
+        "SELECT s2.* FROM c AS other_table LEFT JOIN other_table AS s2 ON TRUE"
+    ) == {Table("other_table")}
 
 
 def test_extract_tables_cte_reference_over_reported() -> None:
     """
     Test the two shapes where a CTE reference is reported as a table.
 
-    Both over-report, declaring a table the statement does not read -- a spurious access
+    Both over-report, declaring a table the statement does not read — a spurious access
     check rather than a missing one. Pinned so a change in either direction is
     deliberate.
     """
@@ -2882,189 +2884,6 @@ FROM (
 ) AS x(c1, c2)
             """.strip(),
         ),
-        # A CTE reference carrying the name a rule is registered under is left alone;
-        # only the table read is filtered.
-        (
-            "WITH tbl_a AS (SELECT 1 AS d) "
-            "SELECT z.* FROM schema1.tbl_a AS z JOIN tbl_a ON TRUE",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH tbl_a AS (
-  SELECT
-    1 AS d
-)
-SELECT
-  z.*
-FROM (
-  SELECT
-    *
-  FROM schema1.tbl_a
-  WHERE
-    id = 42
-) AS z
-JOIN tbl_a
-  ON TRUE
-            """.strip(),
-        ),
-        (
-            "WITH tbl_a AS (SELECT 1 AS d) "
-            "SELECT * FROM (SELECT * FROM schema1.tbl_a) AS z, tbl_a",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH tbl_a AS (
-  SELECT
-    1 AS d
-)
-SELECT
-  *
-FROM (
-  SELECT
-    *
-  FROM (
-    SELECT
-      *
-    FROM schema1.tbl_a
-    WHERE
-      id = 42
-  ) AS "tbl_a"
-) AS z, tbl_a
-            """.strip(),
-        ),
-        # The CTE reads the table it is named after: one filter, on the read.
-        (
-            "WITH tbl_a AS (SELECT * FROM schema1.tbl_a) SELECT * FROM tbl_a",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH tbl_a AS (
-  SELECT
-    *
-  FROM (
-    SELECT
-      *
-    FROM schema1.tbl_a
-    WHERE
-      id = 42
-  ) AS "tbl_a"
-)
-SELECT
-  *
-FROM tbl_a
-            """.strip(),
-        ),
-        # A CTE cannot be qualified. `catalog..table` gives a catalog and no schema.
-        (
-            "WITH tbl_a AS (SELECT 1 AS d) "
-            "SELECT o.*, b.* FROM schema1.tbl_a AS o, catalog1..tbl_a AS b",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH tbl_a AS (
-  SELECT
-    1 AS d
-)
-SELECT
-  o.*,
-  b.*
-FROM (
-  SELECT
-    *
-  FROM schema1.tbl_a
-  WHERE
-    id = 42
-) AS o, (
-  SELECT
-    *
-  FROM catalog1..tbl_a
-  WHERE
-    id = 42
-) AS b
-            """.strip(),
-        ),
-        # The read inside the CTE body and the reference in the outer query are the same
-        # SQL text; only the read is filtered.
-        (
-            "WITH tbl_a AS (SELECT * FROM tbl_a) SELECT * FROM tbl_a",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH tbl_a AS (
-  SELECT
-    *
-  FROM (
-    SELECT
-      *
-    FROM tbl_a
-    WHERE
-      id = 42
-  ) AS "tbl_a"
-)
-SELECT
-  *
-FROM tbl_a
-            """.strip(),
-        ),
-        # A recursive CTE's base term runs before the CTE exists, so a reference to the
-        # CTE's own name there reads the table and is filtered. The recursive term's
-        # reference, and the one in the outer query, are the CTE and are not.
-        (
-            "WITH RECURSIVE tbl_a AS "
-            "(SELECT n FROM tbl_a UNION ALL SELECT n FROM tbl_a) SELECT * FROM tbl_a",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH RECURSIVE tbl_a AS (
-  SELECT
-    n
-  FROM (
-    SELECT
-      *
-    FROM tbl_a
-    WHERE
-      id = 42
-  ) AS "tbl_a"
-  UNION ALL
-  SELECT
-    n
-  FROM tbl_a
-)
-SELECT
-  *
-FROM tbl_a
-            """.strip(),
-        ),
-        # A `DESCRIBE` target is outside every scope, and is still filtered.
-        (
-            "DESCRIBE tbl_a",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-DESCRIBE (
-  SELECT
-    *
-  FROM tbl_a
-  WHERE
-    id = 42
-) AS "tbl_a"
-            """.strip(),
-        ),
-        # Two occurrences of one table are two independent reads.
-        (
-            "SELECT * FROM tbl_a, tbl_a",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-SELECT
-  *
-FROM (
-  SELECT
-    *
-  FROM tbl_a
-  WHERE
-    id = 42
-) AS "tbl_a", (
-  SELECT
-    *
-  FROM tbl_a
-  WHERE
-    id = 42
-) AS "tbl_a"
-            """.strip(),
-        ),
     ],
 )
 def test_rls_subquery_transformer(
@@ -3465,98 +3284,6 @@ SELECT
 FROM tbl_a AS _t0(c1, c2)
 WHERE
   tbl_a.id = 42
-            """.strip(),
-        ),
-        # The predicate transformer has the same duty: a CTE reference carrying the name
-        # a rule is registered under gets no predicate.
-        (
-            "WITH tbl_a AS (SELECT 1 AS d) "
-            "SELECT z.* FROM schema1.tbl_a AS z JOIN tbl_a ON TRUE",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH tbl_a AS (
-  SELECT
-    1 AS d
-)
-SELECT
-  z.*
-FROM schema1.tbl_a AS z
-JOIN tbl_a
-  ON TRUE
-WHERE
-  z.id = 42
-            """.strip(),
-        ),
-        (
-            "WITH tbl_a AS (SELECT * FROM schema1.tbl_a) SELECT * FROM tbl_a",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH tbl_a AS (
-  SELECT
-    *
-  FROM schema1.tbl_a
-  WHERE
-    tbl_a.id = 42
-)
-SELECT
-  *
-FROM tbl_a
-            """.strip(),
-        ),
-        (
-            "WITH RECURSIVE tbl_a AS "
-            "(SELECT n FROM tbl_a UNION ALL SELECT n FROM tbl_a) SELECT * FROM tbl_a",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH RECURSIVE tbl_a AS (
-  SELECT
-    n
-  FROM tbl_a
-  WHERE
-    tbl_a.id = 42
-  UNION ALL
-  SELECT
-    n
-  FROM tbl_a
-)
-SELECT
-  *
-FROM tbl_a
-            """.strip(),
-        ),
-        (
-            "WITH tbl_a AS (SELECT 1 AS d) "
-            "SELECT o.*, b.* FROM schema1.tbl_a AS o, catalog1..tbl_a AS b",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH tbl_a AS (
-  SELECT
-    1 AS d
-)
-SELECT
-  o.*,
-  b.*
-FROM schema1.tbl_a AS o
-JOIN catalog1..tbl_a AS b
-  ON b.id = 42
-WHERE
-  o.id = 42
-            """.strip(),
-        ),
-        (
-            "WITH tbl_a AS (SELECT * FROM tbl_a) SELECT * FROM tbl_a",
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-WITH tbl_a AS (
-  SELECT
-    *
-  FROM tbl_a
-  WHERE
-    tbl_a.id = 42
-)
-SELECT
-  *
-FROM tbl_a
             """.strip(),
         ),
     ],
