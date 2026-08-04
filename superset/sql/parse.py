@@ -2025,10 +2025,13 @@ def is_cte(source: exp.Table, scope: Scope) -> bool:
     table sharing that alias would be taken for the CTE and dropped.
 
     Where sqlglot registers a name differently than SQL scopes it, this errs toward
-    reporting a table — a spurious access check rather than a missing one — for a
-    reference differing from the CTE in letter case, and for a ``WITH RECURSIVE``
-    item's reference to itself or to a later item. A read in a recursive item's base
-    term is the exception: it is not reported.
+    reporting a table: a reference differing from the CTE in letter case, and a
+    ``WITH RECURSIVE`` item's reference to itself or to a later item outside a
+    set-operation body. That costs an access check the statement does not need, and
+    where the engine treats the reference as the CTE it also has the rewrite apply the
+    rule to the CTE's projection, which the database rejects if the column is absent.
+    Erring the other way: a read in a recursive item's base term is legal and is not
+    reported.
     """
     if source.db or source.catalog:
         return False
