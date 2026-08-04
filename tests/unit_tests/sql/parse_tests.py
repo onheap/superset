@@ -772,13 +772,22 @@ def test_extract_tables_cte_name_shared_with_table() -> None:
         "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders"
     ) == {Table("orders")}
 
+    # A catalog is as disqualifying as a schema. `catalog..table` names a catalog and no
+    # schema, and reaches the check only when pivoted -- sqlglot substitutes the CTE's
+    # scope for every other reference whose name it resolves itself.
+    assert extract_tables_from_sql(
+        "WITH orders AS (SELECT 1 AS amt, 'a' AS mth) "
+        "SELECT * FROM cat..orders PIVOT(SUM(amt) FOR mth IN ('a'))",
+        engine="snowflake",
+    ) == {Table("orders", None, "cat")}
+
 
 def test_extract_tables_cte_reference_not_table() -> None:
     """
     Test the counterpart: a reference that does resolve to a CTE is not a table.
 
-    Includes the two shapes a bare-name comparison gets wrong, which is why the name has
-    to be resolved: a recursive CTE's self-reference, and a pivoted reference.
+    A non-recursive item's reference to itself is the shape a bare-name comparison gets
+    wrong, which is why the name has to be resolved rather than compared.
     """
     assert (
         extract_tables_from_sql(
@@ -789,14 +798,23 @@ def test_extract_tables_cte_reference_not_table() -> None:
         == set()
     )
 
-    # Pivoted at the top level. Only `other_table` is read.
+
+def test_extract_tables_pivoted_cte_reference_is_not_a_table() -> None:
+    """
+    Test that pivoting a CTE reference does not make it a table read.
+
+    Pivoting yields a new relation, which is why sqlglot keeps the reference as an
+    ``exp.Table`` rather than substituting the CTE's scope, so this is the one shape
+    where a CTE reference reaches ``is_cte()`` unqualified. The table the CTE reads is
+    still reported.
+    """
     assert extract_tables_from_sql(
         "WITH c AS (SELECT a, b FROM other_table) "
         "SELECT * FROM c PIVOT(SUM(b) FOR a IN ('p'))",
         engine="snowflake",
     ) == {Table("other_table")}
 
-    # And pivoted inside a derived table.
+    # Also when the pivot sits inside a derived table.
     assert extract_tables_from_sql(
         "WITH c AS (SELECT a, b FROM other_table) "
         "SELECT * FROM (SELECT * FROM c PIVOT(SUM(b) FOR a IN ('p'))) AS z",
