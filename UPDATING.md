@@ -60,6 +60,16 @@ the read inside the CTE body. A query whose CTE reads something else loses a fil
 was never meant for it, so row counts may rise — register a rule on the table the CTE
 actually reads to filter it deliberately.
 
+### Table aliases keep their quoting through the row-level security rewrite
+
+Both RLS transformers took the table alias as a string with its quoting stripped and
+emitted it verbatim, so an alias containing SQL became part of the rewritten statement.
+They now carry the parsed identifier. A column alias list (`FROM t AS x (c1, c2)`) also
+survives the rewrite instead of being dropped, so a query selecting `c1` resolves it
+against the list rather than against the table. Emitted SQL is unchanged for aliases that
+are plain identifiers. On Snowflake this also repairs row-level security for any aliased
+table, which previously raised `AttributeError` during the rewrite.
+
 ### Principal listing APIs now honour related-field filters
 
 Two authorization-related listing behaviors changed for API clients. Neither

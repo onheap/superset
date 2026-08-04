@@ -2822,6 +2822,66 @@ FROM (
 LIMIT 100
         """.strip(),
         ),
+        (
+            'SELECT * FROM tbl_a AS "x AND 1 = 0 OR 1 = 1"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM (
+  SELECT
+    *
+  FROM tbl_a
+  WHERE
+    id = 42
+) AS "x AND 1 = 0 OR 1 = 1"
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "TRUE OR TRUE --"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM (
+  SELECT
+    *
+  FROM tbl_a
+  WHERE
+    id = 42
+) AS "TRUE OR TRUE --"
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "a""b"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM (
+  SELECT
+    *
+  FROM tbl_a
+  WHERE
+    id = 42
+) AS "a""b"
+            """.strip(),
+        ),
+        (
+            "SELECT c1 FROM tbl_a AS x (c1, c2)",
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  c1
+FROM (
+  SELECT
+    *
+  FROM tbl_a
+  WHERE
+    id = 42
+) AS x(c1, c2)
+            """.strip(),
+        ),
         # A CTE reference carrying the name a rule is registered under is left alone;
         # only the table read is filtered.
         (
@@ -3347,6 +3407,64 @@ INSERT INTO some_table (
 )
 VALUES
   (1, 2)
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "x AND 1 = 0 OR 1 = 1"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS "x AND 1 = 0 OR 1 = 1"
+WHERE
+  "x AND 1 = 0 OR 1 = 1".id = 42
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "TRUE OR TRUE --"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS "TRUE OR TRUE --"
+WHERE
+  "TRUE OR TRUE --".id = 42
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "a""b"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS "a""b"
+WHERE
+  "a""b".id = 42
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "a.b"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS "a.b"
+WHERE
+  "a.b".id = 42
+            """.strip(),
+        ),
+        # An alias can be a column list with no name of its own, whose ``this`` is
+        # ``None``. Qualifying with the table keeps the predicate from resolving outward
+        # into an enclosing scope.
+        (
+            "SELECT * FROM tbl_a AS (c1, c2)",
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS _t0(c1, c2)
+WHERE
+  tbl_a.id = 42
             """.strip(),
         ),
         # The predicate transformer has the same duty: a CTE reference carrying the name

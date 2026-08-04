@@ -308,13 +308,15 @@ class RLSAsPredicateTransformer(RLSTransformer):
         if not predicate:
             return node
 
-        # qualify columns with table name
-        # ``node.args["alias"].this`` rather than ``node.alias``: the property returns
-        # the alias as a ``str`` with its quoting stripped, and qualifying a column with
-        # a string emits it verbatim, so an alias holding SQL is injected straight into
-        # the predicate this transformer is building.
+        # Qualify columns with the parsed alias node, not ``node.alias``: that property
+        # strips the quoting, and a string qualifier is emitted verbatim, so an alias
+        # holding SQL would land inside the predicate. ``FROM t AS (c1, c2)`` has no
+        # alias name at all; qualify with the table there, since an unqualified column
+        # could otherwise resolve against an enclosing scope.
+        table_alias = node.args.get("alias")
+        qualifier = (table_alias and table_alias.this) or node.this
         for column in predicate.find_all(exp.Column):
-            column.set("table", node.alias or node.this)
+            column.set("table", qualifier.copy())
 
         if isinstance(node.parent, exp.From):
             select = node.parent.parent
@@ -365,8 +367,13 @@ class RLSAsSubqueryTransformer(RLSTransformer):
             return node
 
         if predicate := self.get_predicate(node):
-            if node.alias:
-                alias = node.alias
+            if existing_alias := node.args.get("alias"):
+                # Carry the parsed node over rather than rebuilding from ``node.alias``:
+                # that property strips the quoting, and a string passed as ``alias=`` is
+                # emitted verbatim after ``AS``, so an alias holding SQL is re-emitted
+                # as SQL and appends an unfiltered branch. The node also carries the
+                # column alias list, so ``FROM t AS x (c1, c2)`` still renames columns.
+                alias = existing_alias
             else:
                 # Use just the table name (not schema-qualified) so that
                 # column references like ``table.column`` still resolve after
