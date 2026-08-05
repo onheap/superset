@@ -111,7 +111,13 @@ from superset.exceptions import (
 )
 from superset.extensions import feature_flag_manager
 from superset.jinja_context import BaseTemplateProcessor
-from superset.sql.parse import has_aggregate, sanitize_clause, SQLScript, SQLStatement
+from superset.sql.parse import (
+    has_aggregate,
+    RLSUnsupportedError,
+    sanitize_clause,
+    SQLScript,
+    SQLStatement,
+)
 from superset.superset_typing import (
     AdhocColumn,
     AdhocMetric,
@@ -2898,6 +2904,11 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                 if rls_applied:
                     from_sql = parsed_script.format()
 
+            except RLSUnsupportedError:
+                # A refusal to filter is a security decision, not a best-effort
+                # attempt: the statement cannot be row-filtered safely, so it must
+                # not run against the original, unfiltered SQL. Fail closed.
+                raise
             except Exception as ex:
                 # Log the error but don't fail - RLS application is best-effort
                 logger.warning("Failed to apply RLS to virtual dataset SQL: %s", ex)

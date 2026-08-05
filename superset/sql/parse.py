@@ -688,12 +688,11 @@ def apply_rls_as_cte(
     that same enumeration (``_rls_assert_all_filtered``): if any authorised read is
     still exposed the statement is refused, never emitted unfiltered.
 
-    A statement whose outermost node cannot carry a ``WITH`` -- ``UPDATE``/``DELETE``
-    /``MERGE`` that read a protected table in a predicate subquery -- is *refused*
-    rather than filtered.  Filtering in place there would need the predicate injected
-    into the enclosing ``WHERE``/``ON`` (the ``AS_PREDICATE`` method's job), which
-    cannot be done without the scope-escape risks this method exists to avoid; failing
-    closed is the safe choice and callers on such engines use ``AS_PREDICATE``.
+    This attaches a single ``WITH`` to the statement's outermost query, so a statement
+    whose root cannot carry one -- an ``UPDATE``/``DELETE``/``MERGE`` that reads a
+    protected table in a predicate subquery -- is *refused*.  Such a read is isolable
+    and could in principle be hoisted onto the subquery that contains it, but this
+    rewrite does not attach per-subquery clauses; refusing is the fail-closed choice.
 
     A hoisted CTE is materialised or treated as an optimiser fence by some engines, so
     predicate push-down across it can differ from the previous inline-subquery form.
