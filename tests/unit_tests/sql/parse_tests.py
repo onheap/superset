@@ -3337,41 +3337,128 @@ FROM c AS o1, __rls_0_orders AS o1
     )
 
 
+def test_rls_cte_correlated_lateral_hoists_once() -> None:
+    """
+    A protected table read by a correlated ``LATERAL`` is hoisted exactly once.
+
+    sqlglot registers the same outer ``exp.Table`` node in two scopes for a correlated
+    ``LATERAL``, so without node-identity de-duplication it was hoisted twice into a
+    chained ``__rls_1___rls_0_t`` CTE. It must produce a single filtering CTE.
+    """
+    rules = {Table("t", "schema1", "catalog1"): "tenant_id = 1"}
+    result = _apply_rls_cte(
+        "SELECT t.id, l.c FROM t, "
+        "LATERAL (SELECT count(*) c FROM u WHERE u.tid = t.id) l",
+        rules,
+    )
+    assert result == (
+        """
+WITH __rls_0_t AS (
+  SELECT
+    *
+  FROM t
+  WHERE
+    tenant_id = 1
+)
+SELECT
+  t.id,
+  l.c
+FROM __rls_0_t AS "t", LATERAL (
+  SELECT
+    COUNT(*) AS c
+  FROM u
+  WHERE
+    u.tid = t.id
+) AS l
+        """.strip()
+    )
+    # Hoisted once: no chained CTE reading a CTE that reads the table.
+    assert "__rls_1_" not in result
+
+
 @pytest.mark.parametrize(
-    "sql",
+    "sql, engine, target",
     [
-        "SELECT * FROM t",
-        "SELECT * FROM a JOIN b ON a.id = b.id",
-        "SELECT * FROM (SELECT * FROM a) x JOIN b ON x.id = b.id",
-        "SELECT * FROM a WHERE id IN (SELECT id FROM b)",
-        "WITH c AS (SELECT * FROM a) SELECT * FROM c JOIN b ON c.id = b.id",
-        "WITH orders AS (SELECT id FROM orders) SELECT * FROM orders",
-        "SELECT * FROM a UNION ALL SELECT * FROM b",
-        "SELECT * FROM a AS x JOIN a AS y ON x.id = y.id",
-        "SELECT amount FROM (a CROSS JOIN b) sub",
-        "WITH c AS (SELECT x FROM b) SELECT amount FROM c AS o1, a AS o1",
-        "SELECT * FROM a PIVOT(SUM(x) FOR y IN ('p', 'q'))",
+        (
+            "DELETE FROM some_table WHERE id IN (SELECT id FROM other_table)",
+            "postgresql",
+            "other_table",
+        ),
+        (
+            "MERGE INTO tgt AS t USING (SELECT * FROM src) AS s ON t.id = s.id "
+            "WHEN MATCHED THEN UPDATE SET t.x = s.x",
+            "postgresql",
+            "src",
+        ),
     ],
 )
-def test_rls_filtered_set_equals_authorized_set(sql: str) -> None:
+def test_rls_cte_dml_reading_protected_table_is_refused(
+    sql: str, engine: str, target: str
+) -> None:
     """
-    The rewrite filters exactly the reads the authorisation layer authorises.
+    A protected read inside a ``DELETE``/``MERGE`` that cannot host a ``WITH`` is
+    refused rather than emitted unfiltered.
+    """
+    statement = SQLStatement(sql, engine)
+    with pytest.raises(RLSUnsupportedError, match="cannot carry a WITH"):
+        statement.apply_rls(
+            "catalog1",
+            "schema1",
+            {Table(target, "schema1", "catalog1"): [parse_one("tenant_id = 1")]},
+            RLSMethod.AS_SUBQUERY,
+        )
 
-    For a rule on every table the statement reads, every real read that
-    ``extract_tables_from_statement`` authorises must end up inside a filtering CTE in
-    the output (or the statement is refused). A read authorised but left unfiltered is
-    a cross-tenant leak; this pins that it cannot happen.
+
+@pytest.mark.parametrize(
+    "sql, expected_authorized",
+    [
+        ("SELECT * FROM t", {"t"}),
+        ("SELECT * FROM a JOIN b ON a.id = b.id", {"a", "b"}),
+        ("SELECT * FROM (SELECT * FROM a) x JOIN b ON x.id = b.id", {"a", "b"}),
+        ("SELECT * FROM a WHERE id IN (SELECT id FROM b)", {"a", "b"}),
+        (
+            "WITH c AS (SELECT * FROM a) SELECT * FROM c JOIN b ON c.id = b.id",
+            {"a", "b"},
+        ),
+        ("WITH orders AS (SELECT id FROM orders) SELECT * FROM orders", {"orders"}),
+        ("SELECT * FROM a UNION ALL SELECT * FROM b", {"a", "b"}),
+        ("SELECT * FROM a AS x JOIN a AS y ON x.id = y.id", {"a"}),
+        ("SELECT amount FROM (a CROSS JOIN b) sub", {"a", "b"}),
+        ("WITH c AS (SELECT x FROM b) SELECT amount FROM c AS o1, a AS o1", {"a", "b"}),
+        ("SELECT * FROM a PIVOT(SUM(x) FOR y IN ('p', 'q'))", {"a"}),
+        (
+            "SELECT a.id, l.c FROM a, "
+            "LATERAL (SELECT count(*) c FROM b WHERE b.k = a.id) l",
+            {"a", "b"},
+        ),
+    ],
+)
+def test_rls_filtered_set_covers_authorized_set(
+    sql: str, expected_authorized: set[str]
+) -> None:
     """
+    Every authorised real read ends up inside a filtering CTE in the output.
+
+    ``expected_authorized`` is written by hand rather than read back from the rewrite's
+    own enumeration, so this fails -- rather than pass vacuously -- if enumeration ever
+    drops a read the authorisation layer authorises. A read authorised but left
+    unfiltered is a cross-tenant leak; this pins that it cannot happen. The concrete
+    leak-shape guards are ``test_rls_cte_filters_real_read_inside_derived_join`` and
+    ``test_rls_cte_filters_real_table_aliased_to_a_cte_key``.
+    """
+    # The authorisation layer must agree the hand-written set is what it reads.
     statement = SQLStatement(sql, "postgres")
-    authorized = extract_tables_from_statement(statement._parsed, None)
-    predicates = {
-        t.qualify(catalog="catalog1", schema="schema1"): [parse_one("tenant_id = 1")]
-        for t in authorized
-    }
+    assert {
+        t.table for t in extract_tables_from_statement(statement._parsed, None)
+    } == expected_authorized
 
+    predicates = {
+        Table(name, "schema1", "catalog1"): [parse_one("tenant_id = 1")]
+        for name in expected_authorized
+    }
     statement.apply_rls("catalog1", "schema1", predicates, RLSMethod.AS_SUBQUERY)
 
-    # Physical tables read directly under the injected RLS predicate.
+    # Physical tables read directly under the injected RLS predicate in the output.
     filtered: set[str] = set()
     for select in statement._parsed.find_all(exp.Select):
         where = select.args.get("where")
@@ -3381,7 +3468,7 @@ def test_rls_filtered_set_equals_authorized_set(sql: str) -> None:
         if from_ and isinstance(from_.this, exp.Table):
             filtered.add(from_.this.name)
 
-    assert {t.table for t in authorized} <= filtered
+    assert expected_authorized <= filtered
 
 
 @pytest.mark.parametrize(

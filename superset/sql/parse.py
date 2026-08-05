@@ -401,8 +401,16 @@ def _rls_collect_targets(
     statement -- so a read the caller was authorised against is a read this hoists.
     """
     out: list[tuple[exp.Table, list[exp.Expression]]] = []
+    seen: set[int] = set()
     for node, _scope in _rls_real_reads(ast):
+        # A correlated ``LATERAL`` registers the same outer ``exp.Table`` node in two
+        # scopes' ``sources``, so the identical node is yielded twice.  Hoist each
+        # physical node once; otherwise it is wrapped in a CTE that reads the CTE that
+        # reads it -- redundant, and unsafe for a non-idempotent predicate.
+        if id(node) in seen:
+            continue
         if predicates := lookup(node):
+            seen.add(id(node))
             out.append((node, predicates))
     return out
 
@@ -686,6 +694,10 @@ def apply_rls_as_cte(
     into the enclosing ``WHERE``/``ON`` (the ``AS_PREDICATE`` method's job), which
     cannot be done without the scope-escape risks this method exists to avoid; failing
     closed is the safe choice and callers on such engines use ``AS_PREDICATE``.
+
+    A hoisted CTE is materialised or treated as an optimiser fence by some engines, so
+    predicate push-down across it can differ from the previous inline-subquery form.
+    This changes query plans, not results.
     """
     targets = _rls_collect_targets(ast, lookup)
     ast = _rls_unwrap_redundant_paren(ast, targets)
