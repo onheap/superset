@@ -28,6 +28,9 @@ from superset.exceptions import QueryClauseValidationException, SupersetParseErr
 from superset.jinja_context import JinjaTemplateProcessor
 from superset.sql.parse import (
     _check_script_length,
+    _rls_assert_all_filtered,
+    _rls_assert_ctes_emit_intact,
+    apply_rls_as_cte,
     BaseSQLStatement,
     CTASMethod,
     extract_tables_from_statement,
@@ -40,6 +43,7 @@ from superset.sql.parse import (
     process_jinja_sql,
     remove_quotes,
     RLSMethod,
+    RLSUnsupportedError,
     sanitize_clause,
     split_kql,
     SQLGLOT_DIALECTS,
@@ -2549,15 +2553,16 @@ def test_as_cte_called_twice() -> None:
             "SELECT t.foo FROM some_table AS t",
             {Table("some_table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  t.foo
-FROM (
+WITH __rls_0_some_table AS (
   SELECT
     *
   FROM some_table
   WHERE
     id = 42
-) AS t
+)
+SELECT
+  t.foo
+FROM __rls_0_some_table AS t
             """.strip(),
         ),
         (
@@ -2573,15 +2578,16 @@ FROM some_table AS t
             "SELECT t.foo FROM some_table AS t WHERE bar = 'baz'",
             {Table("some_table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  t.foo
-FROM (
+WITH __rls_0_some_table AS (
   SELECT
     *
   FROM some_table
   WHERE
     id = 42
-) AS t
+)
+SELECT
+  t.foo
+FROM __rls_0_some_table AS t
 WHERE
   bar = 'baz'
             """.strip(),
@@ -2590,15 +2596,16 @@ WHERE
             "SELECT t.foo FROM schema1.some_table AS t",
             {Table("some_table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  t.foo
-FROM (
+WITH __rls_0_some_table AS (
   SELECT
     *
   FROM schema1.some_table
   WHERE
     id = 42
-) AS t
+)
+SELECT
+  t.foo
+FROM __rls_0_some_table AS t
             """.strip(),
         ),
         (
@@ -2610,15 +2617,16 @@ FROM (
             "SELECT t.foo FROM catalog1.schema1.some_table AS t",
             {Table("some_table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  t.foo
-FROM (
+WITH __rls_0_some_table AS (
   SELECT
     *
   FROM catalog1.schema1.some_table
   WHERE
     id = 42
-) AS t
+)
+SELECT
+  t.foo
+FROM __rls_0_some_table AS t
             """.strip(),
         ),
         (
@@ -2630,15 +2638,16 @@ FROM (
             "SELECT * FROM some_table WHERE 1=1",
             {Table("some_table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  *
-FROM (
+WITH __rls_0_some_table AS (
   SELECT
     *
   FROM some_table
   WHERE
     id = 42
-) AS "some_table"
+)
+SELECT
+  *
+FROM __rls_0_some_table AS "some_table"
 WHERE
   1 = 1
             """.strip(),
@@ -2647,15 +2656,16 @@ WHERE
             "SELECT * FROM table WHERE 1=1",
             {Table("table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  *
-FROM (
+WITH __rls_0_table AS (
   SELECT
     *
   FROM table
   WHERE
     id = 42
-) AS "table"
+)
+SELECT
+  *
+FROM __rls_0_table AS "table"
 WHERE
   1 = 1
             """.strip(),
@@ -2664,15 +2674,16 @@ WHERE
             'SELECT * FROM "table" WHERE 1=1',
             {Table("table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  *
-FROM (
+WITH __rls_0_table AS (
   SELECT
     *
   FROM "table"
   WHERE
     id = 42
-) AS "table"
+)
+SELECT
+  *
+FROM __rls_0_table AS "table"
 WHERE
   1 = 1
             """.strip(),
@@ -2703,16 +2714,17 @@ WHERE
             "SELECT * FROM table JOIN other_table ON table.id = other_table.id",
             {Table("other_table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  *
-FROM table
-JOIN (
+WITH __rls_0_other_table AS (
   SELECT
     *
   FROM other_table
   WHERE
     id = 42
-) AS "other_table"
+)
+SELECT
+  *
+FROM table
+JOIN __rls_0_other_table AS "other_table"
   ON table.id = other_table.id
             """.strip(),
         ),
@@ -2720,15 +2732,16 @@ JOIN (
             'SELECT * FROM "table" JOIN other_table ON "table".id = other_table.id',
             {Table("table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  *
-FROM (
+WITH __rls_0_table AS (
   SELECT
     *
   FROM "table"
   WHERE
     id = 42
-) AS "table"
+)
+SELECT
+  *
+FROM __rls_0_table AS "table"
 JOIN other_table
   ON "table".id = other_table.id
             """.strip(),
@@ -2737,18 +2750,19 @@ JOIN other_table
             "SELECT * FROM (SELECT * FROM some_table)",
             {Table("some_table", "schema1", "catalog1"): "id = 42"},
             """
+WITH __rls_0_some_table AS (
+  SELECT
+    *
+  FROM some_table
+  WHERE
+    id = 42
+)
 SELECT
   *
 FROM (
   SELECT
     *
-  FROM (
-    SELECT
-      *
-    FROM some_table
-    WHERE
-      id = 42
-  ) AS "some_table"
+  FROM __rls_0_some_table AS "some_table"
 )
             """.strip(),
         ),
@@ -2756,15 +2770,16 @@ FROM (
             "SELECT * FROM table UNION ALL SELECT * FROM other_table",
             {Table("table", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  *
-FROM (
+WITH __rls_0_table AS (
   SELECT
     *
   FROM table
   WHERE
     id = 42
-) AS "table"
+)
+SELECT
+  *
+FROM __rls_0_table AS "table"
 UNION ALL
 SELECT
   *
@@ -2775,35 +2790,37 @@ FROM other_table
             "SELECT * FROM table UNION ALL SELECT * FROM other_table",
             {Table("other_table", "schema1", "catalog1"): "id = 42"},
             """
+WITH __rls_0_other_table AS (
+  SELECT
+    *
+  FROM other_table
+  WHERE
+    id = 42
+)
 SELECT
   *
 FROM table
 UNION ALL
 SELECT
   *
-FROM (
-  SELECT
-    *
-  FROM other_table
-  WHERE
-    id = 42
-) AS "other_table"
+FROM __rls_0_other_table AS "other_table"
             """.strip(),
         ),
         (
             "SELECT a.*, b.* FROM tbl_a AS a INNER JOIN tbl_b AS b ON a.col = b.col",
             {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  a.*,
-  b.*
-FROM (
+WITH __rls_0_tbl_a AS (
   SELECT
     *
   FROM tbl_a
   WHERE
     id = 42
-) AS a
+)
+SELECT
+  a.*,
+  b.*
+FROM __rls_0_tbl_a AS a
 INNER JOIN tbl_b AS b
   ON a.col = b.col
             """.strip(),
@@ -2812,16 +2829,17 @@ INNER JOIN tbl_b AS b
             "SELECT a.*, b.* FROM tbl_a a INNER JOIN tbl_b b ON a.col = b.col",
             {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  a.*,
-  b.*
-FROM (
+WITH __rls_0_tbl_a AS (
   SELECT
     *
   FROM tbl_a
   WHERE
     id = 42
-) AS a
+)
+SELECT
+  a.*,
+  b.*
+FROM __rls_0_tbl_a AS a
 INNER JOIN tbl_b AS b
   ON a.col = b.col
             """.strip(),
@@ -2830,15 +2848,16 @@ INNER JOIN tbl_b AS b
             "SELECT * FROM public.flights LIMIT 100",
             {Table("flights", "public", "catalog1"): "\"AIRLINE\" like 'A%'"},
             """
-SELECT
-  *
-FROM (
+WITH __rls_0_flights AS (
   SELECT
     *
   FROM public.flights
   WHERE
     "AIRLINE" LIKE 'A%'
-) AS "flights"
+)
+SELECT
+  *
+FROM __rls_0_flights AS "flights"
 LIMIT 100
         """.strip(),
         ),
@@ -2846,60 +2865,64 @@ LIMIT 100
             'SELECT * FROM tbl_a AS "x AND 1 = 0 OR 1 = 1"',
             {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  *
-FROM (
+WITH __rls_0_tbl_a AS (
   SELECT
     *
   FROM tbl_a
   WHERE
     id = 42
-) AS "x AND 1 = 0 OR 1 = 1"
+)
+SELECT
+  *
+FROM __rls_0_tbl_a AS "x AND 1 = 0 OR 1 = 1"
             """.strip(),
         ),
         (
             'SELECT * FROM tbl_a AS "TRUE OR TRUE --"',
             {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  *
-FROM (
+WITH __rls_0_tbl_a AS (
   SELECT
     *
   FROM tbl_a
   WHERE
     id = 42
-) AS "TRUE OR TRUE --"
+)
+SELECT
+  *
+FROM __rls_0_tbl_a AS "TRUE OR TRUE --"
             """.strip(),
         ),
         (
             'SELECT * FROM tbl_a AS "a""b"',
             {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  *
-FROM (
+WITH __rls_0_tbl_a AS (
   SELECT
     *
   FROM tbl_a
   WHERE
     id = 42
-) AS "a""b"
+)
+SELECT
+  *
+FROM __rls_0_tbl_a AS "a""b"
             """.strip(),
         ),
         (
             "SELECT c1 FROM tbl_a AS x (c1, c2)",
             {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
             """
-SELECT
-  c1
-FROM (
+WITH __rls_0_tbl_a AS (
   SELECT
     *
   FROM tbl_a
   WHERE
     id = 42
-) AS x(c1, c2)
+)
+SELECT
+  c1
+FROM __rls_0_tbl_a AS x(c1, c2)
             """.strip(),
         ),
     ],
@@ -2910,7 +2933,8 @@ def test_rls_subquery_transformer(
     expected: str,
 ) -> None:
     """
-    Test `RLSAsSubqueryTransformer`.
+    Test the ``AS_SUBQUERY`` RLS method, which filters each protected reference by
+    hoisting it into a CTE on the outermost query.
     """
     statement = SQLStatement(sql)
     statement.apply_rls(
@@ -2931,6 +2955,520 @@ def test_rls_invalid_method(mocker: MockerFixture) -> None:
 
     with pytest.raises(ValueError, match="Invalid RLS method: invalid"):
         statement.apply_rls("catalog1", "schema1", predicates, "invalid")  # type: ignore
+
+
+def _apply_rls_cte(
+    sql: str, rules: dict[Table, str], engine: str = "postgresql"
+) -> str:
+    statement = SQLStatement(sql, engine)
+    statement.apply_rls(
+        "catalog1",
+        "schema1",
+        {k: [parse_one(v)] for k, v in rules.items()},
+        RLSMethod.AS_SUBQUERY,
+    )
+    return statement.format()
+
+
+@pytest.mark.parametrize(
+    "sql, expected",
+    [
+        (
+            # A redundant outermost parenthesisation is dropped so the WITH can attach:
+            # there is nowhere valid to put the clause on the ``Subquery`` itself.
+            "(SELECT * FROM some_table)",
+            """
+WITH __rls_0_some_table AS (
+  SELECT
+    *
+  FROM some_table
+  WHERE
+    id = 42
+)
+SELECT
+  *
+FROM __rls_0_some_table AS "some_table"
+            """.strip(),
+        ),
+        (
+            # The clause attaches to the query nested inside an ``INSERT ... SELECT``.
+            "INSERT INTO t2 SELECT * FROM some_table",
+            """
+INSERT INTO t2
+WITH __rls_0_some_table AS (
+  SELECT
+    *
+  FROM some_table
+  WHERE
+    id = 42
+)
+SELECT
+  *
+FROM __rls_0_some_table AS "some_table"
+            """.strip(),
+        ),
+        (
+            # ... and inside a ``CREATE TABLE ... AS SELECT``.
+            "CREATE TABLE t2 AS SELECT * FROM some_table",
+            """
+CREATE TABLE t2 AS
+WITH __rls_0_some_table AS (
+  SELECT
+    *
+  FROM some_table
+  WHERE
+    id = 42
+)
+SELECT
+  *
+FROM __rls_0_some_table AS "some_table"
+            """.strip(),
+        ),
+        (
+            # An injected CTE is prepended to a user's existing WITH, never appended:
+            # a later item may not reference an earlier one's base table by bare name.
+            "WITH x AS (SELECT 1 AS c) SELECT * FROM some_table",
+            """
+WITH __rls_0_some_table AS (
+  SELECT
+    *
+  FROM some_table
+  WHERE
+    id = 42
+), x AS (
+  SELECT
+    1 AS c
+)
+SELECT
+  *
+FROM __rls_0_some_table AS "some_table"
+            """.strip(),
+        ),
+        (
+            # A user CTE colliding with the default injected name forces the next name;
+            # the choice is by name only for cosmetics, never for correctness.
+            "WITH __rls_0_some_table AS (SELECT 1 AS c) SELECT * FROM some_table",
+            """
+WITH __rls_1_some_table AS (
+  SELECT
+    *
+  FROM some_table
+  WHERE
+    id = 42
+), __rls_0_some_table AS (
+  SELECT
+    1 AS c
+)
+SELECT
+  *
+FROM __rls_1_some_table AS "some_table"
+            """.strip(),
+        ),
+        (
+            # Two references to the same protected table share one filtered CTE.
+            "SELECT a.x FROM some_table AS a JOIN some_table AS b ON a.id = b.id",
+            """
+WITH __rls_0_some_table AS (
+  SELECT
+    *
+  FROM some_table
+  WHERE
+    id = 42
+)
+SELECT
+  a.x
+FROM __rls_0_some_table AS a
+JOIN __rls_0_some_table AS b
+  ON a.id = b.id
+            """.strip(),
+        ),
+    ],
+)
+def test_rls_cte_placement(sql: str, expected: str) -> None:
+    """
+    The filtered CTE is hoisted to the outermost query and each protected reference
+    rebound to it, across the several statement shapes that can host a ``WITH``.
+    """
+    rules = {Table("some_table", "schema1", "catalog1"): "id = 42"}
+    assert _apply_rls_cte(sql, rules) == expected
+
+
+def test_rls_cte_leaves_unfiltered_statement_untouched() -> None:
+    """A statement with nothing to filter is returned exactly as it came in."""
+    rules = {Table("some_table", "schema1", "catalog1"): "id = 42"}
+    assert _apply_rls_cte("(SELECT * FROM other_table)", rules) == (
+        "(\n  SELECT\n    *\n  FROM other_table\n)"
+    )
+
+
+def test_rls_cte_shared_name_cte_filters_only_the_real_read() -> None:
+    """
+    A query that reads a real table and also references a same-named CTE filters only
+    the base-table read inside the ``WITH`` body; both references to the CTE stay bound
+    to it and are left untouched, so the statement runs instead of failing closed.
+    """
+    rules = {Table("orders", "schema1", "catalog1"): "tenant = 'A'"}
+    assert _apply_rls_cte(
+        "WITH orders AS (SELECT id FROM orders) SELECT * FROM orders", rules
+    ) == (
+        """
+WITH __rls_0_orders AS (
+  SELECT
+    *
+  FROM orders
+  WHERE
+    tenant = 'A'
+), orders AS (
+  SELECT
+    id
+  FROM __rls_0_orders AS "orders"
+)
+SELECT
+  *
+FROM orders
+        """.strip()
+    )
+    assert _apply_rls_cte(
+        "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders", rules
+    ) == (
+        """
+WITH __rls_0_orders AS (
+  SELECT
+    *
+  FROM orders
+  WHERE
+    tenant = 'A'
+), orders AS (
+  SELECT
+    *
+  FROM __rls_0_orders AS "orders"
+)
+SELECT
+  *
+FROM orders
+        """.strip()
+    )
+
+
+def test_rls_cte_recursive_with_postgres_is_filtered() -> None:
+    """
+    A protected base read in a recursive ``WITH`` is filtered by a prepended CTE and the
+    result round-trips cleanly on a dialect that does not decorate it.
+    """
+    rules = {Table("t", "schema1", "catalog1"): "id = 42"}
+    sql = (
+        "WITH RECURSIVE r AS "
+        "(SELECT * FROM t UNION ALL SELECT * FROM r WHERE 1=1) SELECT * FROM r"
+    )
+    assert _apply_rls_cte(sql, rules, "postgresql") == (
+        """
+WITH RECURSIVE __rls_0_t AS (
+  SELECT
+    *
+  FROM t
+  WHERE
+    id = 42
+), r AS (
+  SELECT
+    *
+  FROM __rls_0_t AS "t"
+  UNION ALL
+  SELECT
+    *
+  FROM r
+  WHERE
+    1 = 1
+)
+SELECT
+  *
+FROM r
+        """.strip()
+    )
+
+
+def test_rls_cte_recursive_with_trino_is_refused() -> None:
+    """
+    On a dialect whose generator synthesises a column-alias list for every CTE in a
+    recursive ``WITH``, the injected ``SELECT *`` body would be emitted with an alias
+    list this rewrite did not create, so the statement is refused rather than run.
+    """
+    rules = {Table("t", "schema1", "catalog1"): "id = 42"}
+    sql = (
+        "WITH RECURSIVE r AS (SELECT * FROM t UNION ALL SELECT * FROM r) "
+        "SELECT * FROM r"
+    )
+    with pytest.raises(RLSUnsupportedError, match="WITH RECURSIVE"):
+        _apply_rls_cte(sql, rules, "trino")
+
+
+def test_rls_cte_unhostable_statement_is_refused() -> None:
+    """
+    A protected reference in a statement that cannot carry a ``WITH`` clause is refused
+    rather than emitted unfiltered.
+    """
+    statement = SQLStatement(
+        "UPDATE some_table SET x = 1 WHERE id IN (SELECT id FROM other_table)",
+        "postgresql",
+    )
+    with pytest.raises(RLSUnsupportedError, match="cannot carry a WITH"):
+        statement.apply_rls(
+            "catalog1",
+            "schema1",
+            {Table("other_table", "schema1", "catalog1"): [parse_one("id = 42")]},
+            RLSMethod.AS_SUBQUERY,
+        )
+
+
+def test_rls_cte_unhostable_statement_without_match_is_untouched() -> None:
+    """
+    A statement that cannot carry a ``WITH`` but reads nothing protected is returned
+    unchanged, not refused.
+    """
+    statement = SQLStatement("UPDATE some_table SET x = 1", "postgresql")
+    statement.apply_rls(
+        "catalog1",
+        "schema1",
+        {Table("other_table", "schema1", "catalog1"): [parse_one("id = 42")]},
+        RLSMethod.AS_SUBQUERY,
+    )
+    assert statement.format() == "UPDATE some_table SET x = 1"
+
+
+def test_rls_assert_all_filtered_raises_on_leftover() -> None:
+    """
+    The output self-check fails closed: a protected reference the rewriter left in place
+    raises rather than reaching the engine unfiltered.
+    """
+    ast = parse_one("SELECT * FROM some_table")
+
+    def lookup(node: exp.Table) -> list[exp.Expression] | None:
+        return [parse_one("id = 42")] if node.name == "some_table" else None
+
+    with pytest.raises(RLSUnsupportedError, match="unfiltered reference"):
+        _rls_assert_all_filtered(ast, lookup)
+
+
+def test_rls_assert_ctes_emit_intact_refuses_unparseable_output(
+    mocker: MockerFixture,
+) -> None:
+    """
+    If the filtered statement will not parse back, its row-level security cannot be
+    vouched for, so it is refused.
+    """
+    ast = parse_one(
+        "WITH RECURSIVE __rls_0_t AS (SELECT * FROM t WHERE id = 42), "
+        "r AS (SELECT * FROM __rls_0_t UNION ALL SELECT * FROM r) SELECT * FROM r"
+    )
+    mocker.patch("sqlglot.parse_one", side_effect=ValueError("boom"))
+    with pytest.raises(RLSUnsupportedError, match="does not parse back"):
+        _rls_assert_ctes_emit_intact(ast, None, {"__rls_0_t"})
+
+
+def test_rls_apply_rls_as_cte_default_dialect() -> None:
+    """``apply_rls_as_cte`` filters correctly when called without a dialect."""
+    ast = parse_one("SELECT * FROM some_table")
+
+    def lookup(node: exp.Table) -> list[exp.Expression] | None:
+        return [parse_one("id = 42")] if node.name == "some_table" else None
+
+    assert apply_rls_as_cte(ast, lookup).sql() == (
+        "WITH __rls_0_some_table AS (SELECT * FROM some_table WHERE id = 42) "
+        'SELECT * FROM __rls_0_some_table AS "some_table"'
+    )
+
+
+def test_rls_cte_filters_real_read_inside_derived_join() -> None:
+    """
+    A real read that carries a join inside a derived table is filtered.
+
+    ``scope.tables`` omits such a table (it surfaces only the joined-to relation), so a
+    rewrite that enumerated off it left this read unfiltered. Enumerating off the
+    authorisation layer's ``scope.sources`` surfaces and filters ``orders``.
+    """
+    rules = {Table("orders", "schema1", "catalog1"): "tenant_id = 1"}
+    assert _apply_rls_cte("SELECT amount FROM (orders CROSS JOIN pub) sub", rules) == (
+        """
+WITH __rls_0_orders AS (
+  SELECT
+    *
+  FROM orders
+  WHERE
+    tenant_id = 1
+)
+SELECT
+  amount
+FROM (
+  __rls_0_orders AS "orders"
+    CROSS JOIN pub
+) AS sub
+        """.strip()
+    )
+
+
+def test_rls_cte_filters_real_table_aliased_to_a_cte_key() -> None:
+    """
+    A real table whose alias collides with a CTE's key is still filtered.
+
+    Classifying by ``scope.sources[alias_or_name]`` resolved the aliased real read to
+    the CTE's scope and skipped it; ``is_cte`` classifies by table name and correctly
+    calls it a real read, so ``orders`` is hoisted and filtered.
+    """
+    rules = {Table("orders", "schema1", "catalog1"): "tenant_id = 1"}
+    assert _apply_rls_cte(
+        "WITH c AS (SELECT x FROM pub) SELECT amount FROM c AS o1, orders AS o1",
+        rules,
+    ) == (
+        """
+WITH __rls_0_orders AS (
+  SELECT
+    *
+  FROM orders
+  WHERE
+    tenant_id = 1
+), c AS (
+  SELECT
+    x
+  FROM pub
+)
+SELECT
+  amount
+FROM c AS o1, __rls_0_orders AS o1
+        """.strip()
+    )
+
+
+def test_rls_cte_correlated_lateral_hoists_once() -> None:
+    """
+    A protected table read by a correlated ``LATERAL`` is hoisted exactly once.
+
+    sqlglot registers the same outer ``exp.Table`` node in two scopes for a correlated
+    ``LATERAL``, so without node-identity de-duplication it was hoisted twice into a
+    chained ``__rls_1___rls_0_t`` CTE. It must produce a single filtering CTE.
+    """
+    rules = {Table("t", "schema1", "catalog1"): "tenant_id = 1"}
+    result = _apply_rls_cte(
+        "SELECT t.id, l.c FROM t, "
+        "LATERAL (SELECT count(*) c FROM u WHERE u.tid = t.id) l",
+        rules,
+    )
+    assert result == (
+        """
+WITH __rls_0_t AS (
+  SELECT
+    *
+  FROM t
+  WHERE
+    tenant_id = 1
+)
+SELECT
+  t.id,
+  l.c
+FROM __rls_0_t AS "t", LATERAL (
+  SELECT
+    COUNT(*) AS c
+  FROM u
+  WHERE
+    u.tid = t.id
+) AS l
+        """.strip()
+    )
+    # Hoisted once: no chained CTE reading a CTE that reads the table.
+    assert "__rls_1_" not in result
+
+
+@pytest.mark.parametrize(
+    "sql, engine, target",
+    [
+        (
+            "DELETE FROM some_table WHERE id IN (SELECT id FROM other_table)",
+            "postgresql",
+            "other_table",
+        ),
+        (
+            "MERGE INTO tgt AS t USING (SELECT * FROM src) AS s ON t.id = s.id "
+            "WHEN MATCHED THEN UPDATE SET t.x = s.x",
+            "postgresql",
+            "src",
+        ),
+    ],
+)
+def test_rls_cte_dml_reading_protected_table_is_refused(
+    sql: str, engine: str, target: str
+) -> None:
+    """
+    A protected read inside a ``DELETE``/``MERGE`` that cannot host a ``WITH`` is
+    refused rather than emitted unfiltered.
+    """
+    statement = SQLStatement(sql, engine)
+    with pytest.raises(RLSUnsupportedError, match="cannot carry a WITH"):
+        statement.apply_rls(
+            "catalog1",
+            "schema1",
+            {Table(target, "schema1", "catalog1"): [parse_one("tenant_id = 1")]},
+            RLSMethod.AS_SUBQUERY,
+        )
+
+
+@pytest.mark.parametrize(
+    "sql, expected_authorized",
+    [
+        ("SELECT * FROM t", {"t"}),
+        ("SELECT * FROM a JOIN b ON a.id = b.id", {"a", "b"}),
+        ("SELECT * FROM (SELECT * FROM a) x JOIN b ON x.id = b.id", {"a", "b"}),
+        ("SELECT * FROM a WHERE id IN (SELECT id FROM b)", {"a", "b"}),
+        (
+            "WITH c AS (SELECT * FROM a) SELECT * FROM c JOIN b ON c.id = b.id",
+            {"a", "b"},
+        ),
+        ("WITH orders AS (SELECT id FROM orders) SELECT * FROM orders", {"orders"}),
+        ("SELECT * FROM a UNION ALL SELECT * FROM b", {"a", "b"}),
+        ("SELECT * FROM a AS x JOIN a AS y ON x.id = y.id", {"a"}),
+        ("SELECT amount FROM (a CROSS JOIN b) sub", {"a", "b"}),
+        ("WITH c AS (SELECT x FROM b) SELECT amount FROM c AS o1, a AS o1", {"a", "b"}),
+        ("SELECT * FROM a PIVOT(SUM(x) FOR y IN ('p', 'q'))", {"a"}),
+        (
+            "SELECT a.id, l.c FROM a, "
+            "LATERAL (SELECT count(*) c FROM b WHERE b.k = a.id) l",
+            {"a", "b"},
+        ),
+    ],
+)
+def test_rls_filtered_set_covers_authorized_set(
+    sql: str, expected_authorized: set[str]
+) -> None:
+    """
+    Every authorised real read ends up inside a filtering CTE in the output.
+
+    ``expected_authorized`` is written by hand rather than read back from the rewrite's
+    own enumeration, so this fails -- rather than pass vacuously -- if enumeration ever
+    drops a read the authorisation layer authorises. A read authorised but left
+    unfiltered is a cross-tenant leak; this pins that it cannot happen. The concrete
+    leak-shape guards are ``test_rls_cte_filters_real_read_inside_derived_join`` and
+    ``test_rls_cte_filters_real_table_aliased_to_a_cte_key``.
+    """
+    # The authorisation layer must agree the hand-written set is what it reads.
+    statement = SQLStatement(sql, "postgres")
+    assert {
+        t.table for t in extract_tables_from_statement(statement._parsed, None)
+    } == expected_authorized
+
+    predicates = {
+        Table(name, "schema1", "catalog1"): [parse_one("tenant_id = 1")]
+        for name in expected_authorized
+    }
+    statement.apply_rls("catalog1", "schema1", predicates, RLSMethod.AS_SUBQUERY)
+
+    # Physical tables read directly under the injected RLS predicate in the output.
+    filtered: set[str] = set()
+    for select in statement._parsed.find_all(exp.Select):
+        where = select.args.get("where")
+        if where is None or "tenant_id = 1" not in where.sql():
+            continue
+        from_ = select.find(exp.From)
+        if from_ and isinstance(from_.this, exp.Table):
+            filtered.add(from_.this.name)
+
+    assert expected_authorized <= filtered
 
 
 @pytest.mark.parametrize(

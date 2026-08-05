@@ -39,7 +39,7 @@ from flask import Flask
 from sqlalchemy.sql.elements import TextClause
 
 from superset.models.helpers import ExploreMixin
-from superset.sql.parse import RLSMethod, SQLStatement, Table
+from superset.sql.parse import RLSMethod, RLSUnsupportedError, SQLStatement, Table
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -190,6 +190,54 @@ class TestVirtualDatasetWithRLS:
         assert inner_sql != original_sql
         # But the column must still be present
         assert "is_green" in inner_sql
+
+
+class TestVirtualDatasetRLSFailsClosed:
+    """
+    A refusal to filter must abort the query, never fall back to unfiltered SQL.
+    """
+
+    @patch(
+        "superset.models.helpers.apply_rls",
+        side_effect=RLSUnsupportedError("cannot filter safely"),
+    )
+    def test_rls_unsupported_error_propagates(
+        self,
+        mock_apply_rls: MagicMock,
+        virtual_datasource: MagicMock,
+        app: Flask,
+    ) -> None:
+        """
+        When the RLS rewrite refuses (``RLSUnsupportedError``), ``get_from_clause``
+        must raise -- not swallow the error and build the FROM from the original,
+        unfiltered SQL. Otherwise a statement that cannot be filtered safely would run
+        with no RLS, leaking across tenants.
+        """
+        _set_virtual_sql(virtual_datasource, "SELECT pen_id FROM public.pens")
+
+        with pytest.raises(RLSUnsupportedError):
+            virtual_datasource.get_from_clause(template_processor=None)
+
+    @patch(
+        "superset.models.helpers.apply_rls",
+        side_effect=ValueError("some unrelated hiccup"),
+    )
+    def test_unrelated_error_is_still_best_effort(
+        self,
+        mock_apply_rls: MagicMock,
+        virtual_datasource: MagicMock,
+        app: Flask,
+    ) -> None:
+        """
+        A non-security failure remains best-effort: the original SQL is still used, so
+        narrowing the ``except`` to re-raise only ``RLSUnsupportedError`` does not turn
+        every incidental error into a hard failure.
+        """
+        original_sql = "SELECT pen_id FROM public.pens"
+        _set_virtual_sql(virtual_datasource, original_sql)
+
+        inner_sql = _get_subquery_sql(virtual_datasource)
+        assert inner_sql == original_sql
 
 
 # ---------------------------------------------------------------------------

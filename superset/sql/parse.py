@@ -22,7 +22,7 @@ import enum
 import logging
 import re
 import urllib.parse
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Generic, Optional, TYPE_CHECKING, TypeVar
 
@@ -329,61 +329,404 @@ class RLSAsPredicateTransformer(RLSTransformer):
         return node
 
 
-class RLSAsSubqueryTransformer(RLSTransformer):
+#: Prefix used when *naming* injected CTEs.  Nothing about the rewrite's correctness
+#: depends on this prefix being reserved: collisions are resolved by picking another
+#: name, and "is this reference inside a CTE we injected?" is answered by node
+#: identity, never by the name.  Answering it by name would hand the caller an
+#: opt-out -- a user CTE called ``__rls_0_orders`` would make every reference inside
+#: it look already filtered, which is a complete bypass.
+RLS_CTE_PREFIX = "__rls_"
+
+#: ``exp.Table`` arguments that describe the relation the *reference* produces rather
+#: than the physical table it names.  These stay at the reference site; every other
+#: argument travels, untouched, into the CTE body with the table node.  A new sqlglot
+#: argument therefore defaults to "travels with the table", which is the
+#: semantics-preserving choice, because it stays attached to the same node.
+_RLS_SITE_ARGS = ("alias", "joins", "laterals", "pivots")
+
+#: Node types that can carry a ``WITH`` clause and are a query.
+_RLS_QUERY_NODES = (exp.Select, exp.SetOperation, exp.Subquery)
+
+
+class RLSUnsupportedError(Exception):
     """
-    Apply Row Level Security role as a subquery.
+    The statement cannot be row-filtered safely, so it must not run.
 
-    This transformer will apply any RLS predicates to the relevant tables. For example,
-    given the RLS rule:
+    Raised rather than returning a statement whose filtering cannot be vouched for.
+    """
 
-        table: some_table
-        clause: id = 42
 
-    If a user subject to the rule runs the following query:
+def _rls_real_reads(ast: exp.Expression) -> Iterable[tuple[exp.Table, Scope]]:
+    """
+    Yield every real (non-CTE) table read, paired with the scope it resolves in.
+
+    This is *exactly* the enumeration and classifier the authorisation layer uses:
+    ``extract_tables_from_statement`` walks ``scope.sources.values()`` and drops the
+    entries ``is_cte`` recognises.  The rewrite drives target selection and its output
+    self-check off this same helper, so the set of reads that are authorised, the set
+    that are filtered, and the set that are verified are provably the same set -- a
+    read cannot be authorised by one enumeration and skipped by another.
+
+    ``scope.tables`` is deliberately *not* used: it omits a table that carries a join
+    (``FROM (orders CROSS JOIN pub) sub`` surfaces only ``pub`` there), and classifying
+    by ``scope.sources[alias_or_name]`` misreads a real table aliased to a CTE's key as
+    the CTE.  Both drop authorised reads, i.e. leak.
+    """
+    for scope in traverse_scope(ast):
+        for source in scope.sources.values():
+            if isinstance(source, exp.Table) and not is_cte(source, scope):
+                yield source, scope
+
+
+def _rls_inside_injected_cte(node: exp.Expression, injected: frozenset[int]) -> bool:
+    """Is ``node`` inside a CTE this rewrite created?  By identity, never by name."""
+    if not injected:
+        return False
+    ancestor = node.parent
+    while ancestor is not None:
+        if id(ancestor) in injected:
+            return True
+        ancestor = ancestor.parent
+    return False
+
+
+def _rls_collect_targets(
+    ast: exp.Expression,
+    lookup: Callable[[exp.Table], list[exp.Expression] | None],
+) -> list[tuple[exp.Table, list[exp.Expression]]]:
+    """
+    Every real table read in the statement that has a predicate.
+
+    Enumerated through ``_rls_real_reads`` -- the authorisation layer's own view of the
+    statement -- so a read the caller was authorised against is a read this hoists.
+    """
+    out: list[tuple[exp.Table, list[exp.Expression]]] = []
+    seen: set[int] = set()
+    for node, _scope in _rls_real_reads(ast):
+        # A correlated ``LATERAL`` registers the same outer ``exp.Table`` node in two
+        # scopes' ``sources``, so the identical node is yielded twice.  Hoist each
+        # physical node once; otherwise it is wrapped in a CTE that reads the CTE that
+        # reads it -- redundant, and unsafe for a non-idempotent predicate.
+        if id(node) in seen:
+            continue
+        if predicates := lookup(node):
+            seen.add(id(node))
+            out.append((node, predicates))
+    return out
+
+
+def _rls_with_host(ast: exp.Expression) -> exp.Expression | None:
+    """
+    The node a ``WITH`` can attach to so it is in scope for the whole statement.
+
+    It must be the **outermost** query.  Attach it to a nested one and the predicate
+    re-enters an enclosing scope, which is the whole property this rewrite exists to
+    provide.
+    """
+    if isinstance(ast, exp.Subquery) and isinstance(
+        ast.this, (exp.Select, exp.SetOperation)
+    ):
+        # A ``Subquery`` renders its own ``WITH`` *before* its parentheses, which is
+        # not valid anywhere it appears, so put the ``WITH`` inside them.
+        return ast.this
+    if isinstance(ast, _RLS_QUERY_NODES):
+        return ast
+    # ``INSERT INTO t <query>``, ``CREATE ... AS <query>``, ``COPY (<query>) TO ...``
+    children = [
+        child
+        for child in (ast.args.get("this"), ast.args.get("expression"))
+        if isinstance(child, _RLS_QUERY_NODES)
+    ]
+    return _rls_with_host(children[0]) if len(children) == 1 else None
+
+
+def _rls_taken_names(ast: exp.Expression) -> set[str]:
+    names = {(cte.alias or "").lower() for cte in ast.find_all(exp.CTE)}
+    for table in ast.find_all(exp.Table):
+        names.add(table.name.lower())
+        if table.alias:
+            names.add(str(table.alias).lower())
+    return names
+
+
+def _rls_sanitise(name: str) -> str:
+    return "".join(c if (c.isalnum() or c == "_") else "_" for c in name)[:40] or "t"
+
+
+def _rls_prepend_ctes(
+    host: exp.Expression, ctes: Iterable[tuple[str, exp.Select]]
+) -> list[exp.CTE]:
+    """
+    Prepend, never append.
+
+    A non-recursive ``WITH`` item may only reference *preceding* items, so an appended
+    CTE is a forward reference: Trino rejects it, and PostgreSQL resolves the name to
+    the base table instead, which would silently undo the filter.
+    """
+    nodes = [
+        exp.CTE(this=body, alias=exp.TableAlias(this=exp.to_identifier(name)))
+        for name, body in ctes
+    ]
+    if existing := host.args.get("with_"):
+        existing.set("expressions", nodes + existing.expressions)
+    else:
+        host.set("with_", exp.With(expressions=nodes))
+    return nodes
+
+
+def _rls_assert_all_filtered(
+    ast: exp.Expression,
+    lookup: Callable[[exp.Table], list[exp.Expression] | None],
+    injected: frozenset[int] = frozenset(),
+) -> None:
+    """
+    Post-condition, checked against the authorisation layer's own enumeration.
+
+    Every real read the authorisation layer surfaces (``_rls_real_reads``, the same
+    walk ``extract_tables_from_statement`` uses) that still has a predicate and is not
+    now enclosed in a CTE this rewrite injected is a read the caller was authorised
+    against and the rewrite failed to hoist.  Refuse rather than emit it unfiltered.
+
+    This does *not* go through ``_rls_collect_targets``: a systematic mistake in target
+    selection therefore cannot also silence its own check.  Should selection ever
+    regress -- miss a joined table, misclassify an aliased read -- this still sees the
+    read the authorisation layer authorised and fails closed.
+    """
+    leftover = [
+        node
+        for node, _scope in _rls_real_reads(ast)
+        if not _rls_inside_injected_cte(node, injected) and lookup(node)
+    ]
+    if leftover:
+        names = ", ".join(node.sql() for node in leftover)
+        raise RLSUnsupportedError(
+            f"unfiltered reference(s) survived the row-level security rewrite: {names}"
+        )
+
+
+def _rls_assert_ctes_emit_intact(
+    ast: exp.Expression, dialect: DialectType, names: set[str]
+) -> None:
+    """
+    Refuse if a CTE we injected does not serialise back to what we built.
+
+    A generator may decorate a node we did not ask it to decorate.  One instance:
+    inside a ``WITH RECURSIVE``, sqlglot's Trino generator synthesises a column-alias
+    list for *every* CTE in the clause from that CTE's projection list, so a
+    ``SELECT *`` body is emitted as ``__rls_0_t("*")`` -- a one-element alias list
+    against a relation with however many columns the table has.  The engine rejects
+    that today, but the
+    validity of a security rewrite must not rest on an arity coincidence: against a
+    single-column table the list would match and the statement's shape would be partly
+    the caller's to choose.
+
+    Checked by round-tripping rather than by naming the dialects that do it, so a
+    different generator quirk in the same position is caught too.  Only the injected
+    CTEs are inspected: what the *caller's* own CTEs serialise to is not this
+    function's business.
+    """
+    if not names:
+        return
+    with_node = ast.args.get("with_") if hasattr(ast, "args") else None
+    if not isinstance(with_node, exp.With) or not with_node.args.get("recursive"):
+        # Only a recursive WITH is known to provoke this, and re-parsing every statement
+        # to check for a quirk that has never appeared elsewhere is not worth the cost.
+        return
+
+    try:
+        reparsed = sqlglot.parse_one(ast.sql(dialect=dialect), dialect=dialect)
+    except Exception as ex:  # noqa: BLE001
+        raise RLSUnsupportedError(
+            f"the filtered statement does not parse back ({type(ex).__name__}), so its "
+            "row-level security cannot be vouched for"
+        ) from ex
+
+    for cte in reparsed.find_all(exp.CTE):
+        if cte.alias in names and cte.args.get("alias", exp.TableAlias()).args.get(
+            "columns"
+        ):
+            raise RLSUnsupportedError(
+                f"the row-level security CTE {cte.alias} is serialised with a column "
+                "alias list this rewrite did not create, so the statement that would "
+                "execute is not the statement that was built; this happens for a "
+                "protected table inside a WITH RECURSIVE clause on some dialects"
+            )
+
+
+def _rls_unwrap_redundant_paren(
+    ast: exp.Expression, targets: list[tuple[exp.Table, list[exp.Expression]]]
+) -> exp.Expression:
+    """
+    Strip a redundant outermost parenthesisation so a ``WITH`` can attach.
+
+    ``(SELECT ...)`` parses as a ``Subquery`` and there is nowhere valid to put the
+    clause: outside the parentheses a ``Subquery`` renders its ``WITH`` before its own
+    ``(``, and inside them some engines reject ``(WITH ... SELECT ...)`` outright.  At
+    statement level those parentheses carry no meaning, so remove them rather than emit
+    SQL the engine refuses.  Only when there is something to filter, and only when the
+    parentheses hold nothing but the query: an alias or an attached join at this
+    position is not a shape this can flatten.
+    """
+    if (
+        targets
+        and isinstance(ast, exp.Subquery)
+        and isinstance(ast.this, (exp.Select, exp.SetOperation))
+        and not any(ast.args.get(arg) for arg in _RLS_SITE_ARGS)
+    ):
+        return ast.this
+    return ast
+
+
+def _rls_hoist_target(
+    node: exp.Table,
+    predicates: list[exp.Expression],
+    ctes: dict[tuple[str, str], tuple[str, exp.Select]],
+    taken: set[str],
+    counter: int,
+    dialect: DialectType,
+) -> int:
+    """
+    Hoist one protected reference into a filtered CTE and rebind it in place.
+
+    ``ctes`` and ``taken`` are updated in place; the next unused CTE counter is
+    returned so the caller can thread it across references.
+    """
+    original_name = node.name
+
+    # Split the container: site arguments stay, everything else travels with the table
+    # node into the CTE body, unread and uninterpreted.
+    site = {key: node.args.get(key) for key in _RLS_SITE_ARGS}
+    body_table = node.copy()
+    for key in _RLS_SITE_ARGS:
+        body_table.set(key, None)
+
+    # One CTE per (physical-relation signature, predicate).  Two references to the same
+    # table share a CTE -- one filtered scan instead of N -- while
+    # ``t FOR VERSION AS OF 1`` and ``FOR VERSION AS OF 2`` are different physical
+    # relations and must not.
+    predicate = sqlglot.and_(*predicates)
+    key = (body_table.sql(dialect=dialect), predicate.sql(dialect=dialect))
+    if key not in ctes:
+        while True:
+            name = f"{RLS_CTE_PREFIX}{counter}_{_rls_sanitise(original_name)}"
+            counter += 1
+            if name.lower() not in taken:
+                break
+        taken.add(name.lower())
+        ctes[key] = (
+            name,
+            exp.Select(
+                expressions=[exp.Star()],
+                from_=exp.From(this=body_table),
+                where=exp.Where(this=predicate),
+            ),
+        )
+    cte_name = ctes[key][0]
+
+    # Rebind the name.  Nothing else about the node is read or rebuilt.
+    for arg in list(node.args):
+        if arg not in _RLS_SITE_ARGS:
+            node.set(arg, None)
+    node.set("this", exp.to_identifier(cte_name))
+    for arg, value in site.items():
+        if value:
+            node.set(arg, value)
+
+    # An unaliased reference lends its bare name to column qualifiers
+    # (``SELECT orders.id FROM orders``).  Renaming it would strand those, so bind the
+    # old name back as an alias.
+    if not node.args.get("alias"):
+        node.set(
+            "alias",
+            exp.TableAlias(this=exp.Identifier(this=original_name, quoted=True)),
+        )
+    return counter
+
+
+def apply_rls_as_cte(
+    ast: exp.Expression,
+    lookup: Callable[[exp.Table], list[exp.Expression] | None],
+    dialect: DialectType = None,
+) -> exp.Expression:
+    """
+    Filter every protected reference by hoisting a CTE and rebinding the name.
+
+    For example, given the RLS rule ``some_table`` -> ``id = 42`` and the query::
 
         SELECT foo FROM some_table WHERE bar = 'baz'
 
-    The query will be modified to:
+    the statement is rewritten to::
 
-        SELECT foo FROM (SELECT * FROM some_table WHERE id = 42) AS some_table
-        WHERE bar = 'baz'
+        WITH __rls_0_some_table AS (SELECT * FROM some_table WHERE id = 42)
+        SELECT foo FROM __rls_0_some_table WHERE bar = 'baz'
 
-    This approach is probably more secure than using predicates, but it doesn't work for
-    all databases.
+    The predicate is *not* placed at the reference site.  It goes into the body of a
+    CTE on the outermost query, where there is no enclosing scope, so an unqualified
+    column in the predicate can only resolve against the relation it is meant to
+    filter -- or the statement fails.  Placed at the reference site instead, the same
+    unqualified column resolves outward into whatever scope encloses the reference,
+    and a caller who supplies a same-named column turns the filter into a tautology.
+
+    Nothing is replaced.  ``exp.Table`` conflates a physical table with a ``FROM``
+    item: besides the name it carries the alias, the alias column list, its own
+    ``joins`` and ``laterals``, ``TABLESAMPLE``, pivots and a time-travel version.
+    Constructing a replacement node means rebuilding whichever of those the rewriter
+    happens to know about, so the rest is dropped or swallowed, and a replacement is
+    not re-walked -- one predicate is emitted for N relations.  Here only the *name*
+    fields change, in place, so the walk stays total and nothing attached can be lost.
+
+    A CTE reference is left untouched: it is not a table read, and the base-table read
+    it stands for is filtered where the ``WITH`` item defines it.  This is why a query
+    that reads a real table and also references a same-named CTE, such as
+    ``WITH orders AS (SELECT id FROM orders) SELECT * FROM orders``, filters only the
+    real read inside the ``WITH`` body and leaves both ``orders`` references bound to
+    it.
+
+    Reads are enumerated exactly as the authorisation layer enumerates them
+    (``_rls_real_reads`` / ``extract_tables_from_statement``), so a table the caller was
+    authorised against is a table this hoists.  The output is then re-checked against
+    that same enumeration (``_rls_assert_all_filtered``): if any authorised read is
+    still exposed the statement is refused, never emitted unfiltered.
+
+    This attaches a single ``WITH`` to the statement's outermost query, so a statement
+    whose root cannot carry one -- an ``UPDATE``/``DELETE``/``MERGE`` that reads a
+    protected table in a predicate subquery -- is *refused*.  Such a read is isolable
+    and could in principle be hoisted onto the subquery that contains it, but this
+    rewrite does not attach per-subquery clauses; refusing is the fail-closed choice.
+
+    A hoisted CTE is materialised or treated as an optimiser fence by some engines, so
+    predicate push-down across it can differ from the previous inline-subquery form.
+    This changes query plans, not results.
     """
+    targets = _rls_collect_targets(ast, lookup)
+    ast = _rls_unwrap_redundant_paren(ast, targets)
 
-    def __call__(self, node: exp.Expression) -> exp.Expression:
-        if not isinstance(node, exp.Table):
-            return node
+    host = _rls_with_host(ast)
 
-        if predicate := self.get_predicate(node):
-            if existing_alias := node.args.get("alias"):
-                # Carry the parsed node over rather than rebuilding from ``node.alias``:
-                # that property strips the quoting, and a string passed as ``alias=`` is
-                # emitted verbatim after ``AS``, so an alias holding SQL is re-emitted
-                # as SQL and appends an unfiltered branch. The node also carries the
-                # column alias list, so ``FROM t AS x (c1, c2)`` still renames columns.
-                alias = existing_alias
-            else:
-                # Use just the table name (not schema-qualified) so that
-                # column references like ``table.column`` still resolve after
-                # the table is replaced with a subquery.  Using the full
-                # ``schema.table`` path as a quoted identifier creates a
-                # mismatch: the columns reference ``table`` but the alias is
-                # ``"schema.table"``, which are different identifiers.
-                alias = exp.TableAlias(this=exp.Identifier(this=node.name, quoted=True))
-
-            node.set("alias", None)
-            node = exp.Subquery(
-                this=exp.Select(
-                    expressions=[exp.Star()],
-                    where=exp.Where(this=predicate),
-                    from_=exp.From(this=node.copy()),
-                ),
-                alias=alias,
+    if host is None:
+        if targets:
+            raise RLSUnsupportedError(
+                f"{type(ast).__name__} cannot carry a WITH clause, so "
+                f"{len(targets)} protected reference(s) cannot be filtered"
             )
+        return ast
 
-        return node
+    taken = _rls_taken_names(ast)
+    ctes: dict[tuple[str, str], tuple[str, exp.Select]] = {}
+    counter = 0
+    for node, predicates in targets:
+        counter = _rls_hoist_target(node, predicates, ctes, taken, counter, dialect)
+
+    injected: frozenset[int] = frozenset()
+    if ctes:
+        injected = frozenset(
+            id(node) for node in _rls_prepend_ctes(host, list(ctes.values()))
+        )
+
+    _rls_assert_all_filtered(ast, lookup, injected)
+    _rls_assert_ctes_emit_intact(ast, dialect, {name for name, _ in ctes.values()})
+
+    return ast
 
 
 @dataclass(eq=True, frozen=True)
@@ -1403,14 +1746,28 @@ class SQLStatement(BaseSQLStatement[exp.Expression]):
         if not predicates:
             return
 
-        transformers = {
-            RLSMethod.AS_PREDICATE: RLSAsPredicateTransformer,
-            RLSMethod.AS_SUBQUERY: RLSAsSubqueryTransformer,
-        }
-        if method not in transformers:
+        if method == RLSMethod.AS_SUBQUERY:
+            # ``AS_SUBQUERY`` hoists the predicate into a filtered CTE on the outermost
+            # query and rebinds each protected reference to it, so a CTE reference that
+            # merely shares a base table's name is left untouched while the base read it
+            # stands for is still filtered.
+
+            def lookup(node: exp.Table) -> list[exp.Expression] | None:
+                return predicates.get(
+                    Table(
+                        node.name,
+                        node.db if node.db else schema,
+                        node.catalog if node.catalog else catalog,
+                    )
+                )
+
+            self._parsed = apply_rls_as_cte(self._parsed, lookup, dialect=self._dialect)
+            return
+
+        if method != RLSMethod.AS_PREDICATE:
             raise ValueError(f"Invalid RLS method: {method}")
 
-        transformer = transformers[method](catalog, schema, predicates)
+        transformer = RLSAsPredicateTransformer(catalog, schema, predicates)
         self._parsed = self._parsed.transform(transformer)
 
 
@@ -1990,12 +2347,9 @@ def extract_tables_from_statement(
             return set()
         sources = pseudo_query.find_all(exp.Table)
     else:
-        sources = [
-            source
-            for scope in traverse_scope(statement)
-            for source in scope.sources.values()
-            if isinstance(source, exp.Table) and not is_cte(source, scope)
-        ]
+        # The same enumeration the AS_SUBQUERY rewrite filters against, so a table
+        # authorised here is a table that rewrite hoists into a filtering CTE.
+        sources = [source for source, _scope in _rls_real_reads(statement)]
 
     return {
         Table(
