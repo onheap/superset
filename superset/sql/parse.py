@@ -356,19 +356,26 @@ class RLSUnsupportedError(Exception):
     """
 
 
-def _rls_is_cte_reference(node: exp.Table, scope: Scope) -> bool:
+def _rls_real_reads(ast: exp.Expression) -> Iterable[tuple[exp.Table, Scope]]:
     """
-    Does ``node`` name a CTE rather than a table?
+    Yield every real (non-CTE) table read, paired with the scope it resolves in.
 
-    sqlglot has already answered this: a reference it resolved to a CTE appears in
-    ``scope.sources`` as a ``Scope``, not as an ``exp.Table``.  Asking again with a
-    second, name-based algorithm is what made a forward-referenced or circularly
-    referenced ``WITH`` item drop a real table read, so this only consults sqlglot's
-    own resolution -- the same resolution ``extract_tables_from_statement`` uses, and
-    therefore the same one the per-table authorisation check is based on.
+    This is *exactly* the enumeration and classifier the authorisation layer uses:
+    ``extract_tables_from_statement`` walks ``scope.sources.values()`` and drops the
+    entries ``is_cte`` recognises.  The rewrite drives target selection and its output
+    self-check off this same helper, so the set of reads that are authorised, the set
+    that are filtered, and the set that are verified are provably the same set -- a
+    read cannot be authorised by one enumeration and skipped by another.
+
+    ``scope.tables`` is deliberately *not* used: it omits a table that carries a join
+    (``FROM (orders CROSS JOIN pub) sub`` surfaces only ``pub`` there), and classifying
+    by ``scope.sources[alias_or_name]`` misreads a real table aliased to a CTE's key as
+    the CTE.  Both drop authorised reads, i.e. leak.
     """
-    resolved = scope.sources.get(node.alias_or_name)
-    return isinstance(resolved, Scope) and resolved.scope_type == ScopeType.CTE
+    for scope in traverse_scope(ast):
+        for source in scope.sources.values():
+            if isinstance(source, exp.Table) and not is_cte(source, scope):
+                yield source, scope
 
 
 def _rls_inside_injected_cte(node: exp.Expression, injected: frozenset[int]) -> bool:
@@ -386,25 +393,17 @@ def _rls_inside_injected_cte(node: exp.Expression, injected: frozenset[int]) -> 
 def _rls_collect_targets(
     ast: exp.Expression,
     lookup: Callable[[exp.Table], list[exp.Expression] | None],
-    injected: frozenset[int] = frozenset(),
 ) -> list[tuple[exp.Table, list[exp.Expression]]]:
     """
-    Every table reference in the statement that has a predicate, in tree order.
+    Every real table read in the statement that has a predicate.
 
-    One resolver for enumeration and for rewriting, so the set of references that
-    were authorised and the set that get filtered cannot diverge.
+    Enumerated through ``_rls_real_reads`` -- the authorisation layer's own view of the
+    statement -- so a read the caller was authorised against is a read this hoists.
     """
     out: list[tuple[exp.Table, list[exp.Expression]]] = []
-    seen: set[int] = set()
-    for scope in traverse_scope(ast):
-        for node in scope.tables:
-            if id(node) in seen or _rls_is_cte_reference(node, scope):
-                continue
-            if _rls_inside_injected_cte(node, injected):
-                continue
-            if predicates := lookup(node):
-                seen.add(id(node))
-                out.append((node, predicates))
+    for node, _scope in _rls_real_reads(ast):
+        if predicates := lookup(node):
+            out.append((node, predicates))
     return out
 
 
@@ -473,14 +472,25 @@ def _rls_assert_all_filtered(
     injected: frozenset[int] = frozenset(),
 ) -> None:
     """
-    Post-condition: nothing the rewriter was asked to filter is still exposed.
+    Post-condition, checked against the authorisation layer's own enumeration.
 
-    Re-runs the *selection* on the rewritten tree rather than trying to re-recognise
-    the shape it emitted.  Anything found is a reference the rewriter was supposed to
-    touch and did not.
+    Every real read the authorisation layer surfaces (``_rls_real_reads``, the same
+    walk ``extract_tables_from_statement`` uses) that still has a predicate and is not
+    now enclosed in a CTE this rewrite injected is a read the caller was authorised
+    against and the rewrite failed to hoist.  Refuse rather than emit it unfiltered.
+
+    This does *not* go through ``_rls_collect_targets``: a systematic mistake in target
+    selection therefore cannot also silence its own check.  Should selection ever
+    regress -- miss a joined table, misclassify an aliased read -- this still sees the
+    read the authorisation layer authorised and fails closed.
     """
-    if leftover := _rls_collect_targets(ast, lookup, injected):
-        names = ", ".join(node.sql() for node, _ in leftover)
+    leftover = [
+        node
+        for node, _scope in _rls_real_reads(ast)
+        if not _rls_inside_injected_cte(node, injected) and lookup(node)
+    ]
+    if leftover:
+        names = ", ".join(node.sql() for node in leftover)
         raise RLSUnsupportedError(
             f"unfiltered reference(s) survived the row-level security rewrite: {names}"
         )
@@ -663,6 +673,19 @@ def apply_rls_as_cte(
     ``WITH orders AS (SELECT id FROM orders) SELECT * FROM orders``, filters only the
     real read inside the ``WITH`` body and leaves both ``orders`` references bound to
     it.
+
+    Reads are enumerated exactly as the authorisation layer enumerates them
+    (``_rls_real_reads`` / ``extract_tables_from_statement``), so a table the caller was
+    authorised against is a table this hoists.  The output is then re-checked against
+    that same enumeration (``_rls_assert_all_filtered``): if any authorised read is
+    still exposed the statement is refused, never emitted unfiltered.
+
+    A statement whose outermost node cannot carry a ``WITH`` -- ``UPDATE``/``DELETE``
+    /``MERGE`` that read a protected table in a predicate subquery -- is *refused*
+    rather than filtered.  Filtering in place there would need the predicate injected
+    into the enclosing ``WHERE``/``ON`` (the ``AS_PREDICATE`` method's job), which
+    cannot be done without the scope-escape risks this method exists to avoid; failing
+    closed is the safe choice and callers on such engines use ``AS_PREDICATE``.
     """
     targets = _rls_collect_targets(ast, lookup)
     ast = _rls_unwrap_redundant_paren(ast, targets)
@@ -2313,12 +2336,9 @@ def extract_tables_from_statement(
             return set()
         sources = pseudo_query.find_all(exp.Table)
     else:
-        sources = [
-            source
-            for scope in traverse_scope(statement)
-            for source in scope.sources.values()
-            if isinstance(source, exp.Table) and not is_cte(source, scope)
-        ]
+        # The same enumeration the AS_SUBQUERY rewrite filters against, so a table
+        # authorised here is a table that rewrite hoists into a filtering CTE.
+        sources = [source for source, _scope in _rls_real_reads(statement)]
 
     return {
         Table(

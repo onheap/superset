@@ -3277,6 +3277,113 @@ def test_rls_apply_rls_as_cte_default_dialect() -> None:
     )
 
 
+def test_rls_cte_filters_real_read_inside_derived_join() -> None:
+    """
+    A real read that carries a join inside a derived table is filtered.
+
+    ``scope.tables`` omits such a table (it surfaces only the joined-to relation), so a
+    rewrite that enumerated off it left this read unfiltered. Enumerating off the
+    authorisation layer's ``scope.sources`` surfaces and filters ``orders``.
+    """
+    rules = {Table("orders", "schema1", "catalog1"): "tenant_id = 1"}
+    assert _apply_rls_cte("SELECT amount FROM (orders CROSS JOIN pub) sub", rules) == (
+        """
+WITH __rls_0_orders AS (
+  SELECT
+    *
+  FROM orders
+  WHERE
+    tenant_id = 1
+)
+SELECT
+  amount
+FROM (
+  __rls_0_orders AS "orders"
+    CROSS JOIN pub
+) AS sub
+        """.strip()
+    )
+
+
+def test_rls_cte_filters_real_table_aliased_to_a_cte_key() -> None:
+    """
+    A real table whose alias collides with a CTE's key is still filtered.
+
+    Classifying by ``scope.sources[alias_or_name]`` resolved the aliased real read to
+    the CTE's scope and skipped it; ``is_cte`` classifies by table name and correctly
+    calls it a real read, so ``orders`` is hoisted and filtered.
+    """
+    rules = {Table("orders", "schema1", "catalog1"): "tenant_id = 1"}
+    assert _apply_rls_cte(
+        "WITH c AS (SELECT x FROM pub) SELECT amount FROM c AS o1, orders AS o1",
+        rules,
+    ) == (
+        """
+WITH __rls_0_orders AS (
+  SELECT
+    *
+  FROM orders
+  WHERE
+    tenant_id = 1
+), c AS (
+  SELECT
+    x
+  FROM pub
+)
+SELECT
+  amount
+FROM c AS o1, __rls_0_orders AS o1
+        """.strip()
+    )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM t",
+        "SELECT * FROM a JOIN b ON a.id = b.id",
+        "SELECT * FROM (SELECT * FROM a) x JOIN b ON x.id = b.id",
+        "SELECT * FROM a WHERE id IN (SELECT id FROM b)",
+        "WITH c AS (SELECT * FROM a) SELECT * FROM c JOIN b ON c.id = b.id",
+        "WITH orders AS (SELECT id FROM orders) SELECT * FROM orders",
+        "SELECT * FROM a UNION ALL SELECT * FROM b",
+        "SELECT * FROM a AS x JOIN a AS y ON x.id = y.id",
+        "SELECT amount FROM (a CROSS JOIN b) sub",
+        "WITH c AS (SELECT x FROM b) SELECT amount FROM c AS o1, a AS o1",
+        "SELECT * FROM a PIVOT(SUM(x) FOR y IN ('p', 'q'))",
+    ],
+)
+def test_rls_filtered_set_equals_authorized_set(sql: str) -> None:
+    """
+    The rewrite filters exactly the reads the authorisation layer authorises.
+
+    For a rule on every table the statement reads, every real read that
+    ``extract_tables_from_statement`` authorises must end up inside a filtering CTE in
+    the output (or the statement is refused). A read authorised but left unfiltered is
+    a cross-tenant leak; this pins that it cannot happen.
+    """
+    statement = SQLStatement(sql, "postgres")
+    authorized = extract_tables_from_statement(statement._parsed, None)
+    predicates = {
+        t.qualify(catalog="catalog1", schema="schema1"): [parse_one("tenant_id = 1")]
+        for t in authorized
+    }
+
+    statement.apply_rls("catalog1", "schema1", predicates, RLSMethod.AS_SUBQUERY)
+
+    # Physical tables read directly under the injected RLS predicate.
+    filtered: set[str] = set()
+    for select in statement._parsed.find_all(exp.Select):
+        where = select.args.get("where")
+        if where is None or "tenant_id = 1" not in where.sql():
+            continue
+        from_ = select.find(exp.From)
+        if from_ and isinstance(from_.this, exp.Table):
+            filtered.add(from_.this.name)
+
+    assert {t.table for t in authorized} <= filtered
+
+
 @pytest.mark.parametrize(
     "sql, rules, expected",
     [
