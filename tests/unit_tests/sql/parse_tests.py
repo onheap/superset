@@ -2902,6 +2902,87 @@ FROM (
 ) AS x(c1, c2)
             """.strip(),
         ),
+        # A CTE whose name matches the rule's table is not a read of that table: only
+        # the real read inside the CTE body is wrapped, and the outer reference to the
+        # CTE keeps its own projection. Wrapping the reference would filter the CTE's
+        # columns by a rule naming one the projection need not carry, which the database
+        # then rejects.
+        (
+            "WITH some_table AS (SELECT id FROM some_table) SELECT * FROM some_table",
+            {Table("some_table", "schema1", "catalog1"): "id = 42"},
+            """
+WITH some_table AS (
+  SELECT
+    id
+  FROM (
+    SELECT
+      *
+    FROM some_table
+    WHERE
+      id = 42
+  ) AS "some_table"
+)
+SELECT
+  *
+FROM some_table
+            """.strip(),
+        ),
+        # A correlated ``LATERAL`` reads the outer table in both scopes, so the same
+        # node is reached twice; it is wrapped once, not doubly. The lateral's own read
+        # is a distinct node and is wrapped in place.
+        (
+            "SELECT * FROM some_table, LATERAL ("
+            "SELECT * FROM other_table WHERE other_table.x = some_table.x) t",
+            {
+                Table("some_table", "schema1", "catalog1"): "id = 42",
+                Table("other_table", "schema1", "catalog1"): "id = 7",
+            },
+            """
+SELECT
+  *
+FROM (
+  SELECT
+    *
+  FROM some_table
+  WHERE
+    id = 42
+) AS "some_table", LATERAL (
+  SELECT
+    *
+  FROM (
+    SELECT
+      *
+    FROM other_table
+    WHERE
+      id = 7
+  ) AS "other_table"
+  WHERE
+    other_table.x = some_table.x
+) AS t
+            """.strip(),
+        ),
+        # A read nested in a DML statement's subquery is filtered in place, not refused:
+        # the ``UPDATE`` target is not a source, so only the ``SELECT``'s read of ``t``
+        # is enumerated and wrapped.
+        (
+            "UPDATE dst SET x = 1 WHERE id IN (SELECT id FROM t)",
+            {Table("t", "schema1", "catalog1"): "id = 42"},
+            """
+UPDATE dst SET x = 1
+WHERE
+  id IN (
+    SELECT
+      id
+    FROM (
+      SELECT
+        *
+      FROM t
+      WHERE
+        id = 42
+    ) AS "t"
+  )
+            """.strip(),
+        ),
     ],
 )
 def test_rls_subquery_transformer(
@@ -2920,6 +3001,54 @@ def test_rls_subquery_transformer(
         RLSMethod.AS_SUBQUERY,
     )
     assert statement.format() == expected
+
+
+@pytest.mark.parametrize(
+    "sql, read_counts",
+    [
+        ("SELECT * FROM t", {"t": 1}),
+        ("SELECT * FROM t JOIN u ON t.id = u.id", {"t": 1, "u": 1}),
+        ("SELECT * FROM t, u", {"t": 1, "u": 1}),
+        ("SELECT * FROM t WHERE id IN (SELECT id FROM u)", {"t": 1, "u": 1}),
+        # A self-join reads the table through two distinct nodes; both are wrapped.
+        ("SELECT * FROM t AS a JOIN t AS b ON a.id = b.id", {"t": 2}),
+        # The CTE body's read of ``t`` and the outer read of ``t`` are both wrapped;
+        # the CTE reference ``c`` is not a read and carries no rule.
+        (
+            "WITH c AS (SELECT id FROM t) SELECT * FROM c JOIN t AS t2 ON c.id = t2.id",
+            {"t": 2},
+        ),
+        ("SELECT * FROM (SELECT * FROM t) AS x", {"t": 1}),
+    ],
+)
+def test_rls_subquery_filters_every_authorized_read(
+    sql: str,
+    read_counts: dict[str, int],
+) -> None:
+    """
+    The filtered set is a superset of the authorized set and never fails open.
+
+    The reads the rewrite wraps are exactly the tables authorization enforces
+    (``extract_tables_from_statement``). Each read is given a table-specific sentinel
+    predicate; its occurrence count in the output must equal the number of real-read
+    nodes of that table, so a dropped read (fail-open) or a double-wrap is caught.
+    """
+    authorized = {t.table for t in extract_tables_from_statement(parse_one(sql), None)}
+    assert authorized == set(read_counts)
+
+    statement = SQLStatement(sql)
+    statement.apply_rls(
+        "catalog1",
+        "schema1",
+        {
+            Table(table, "schema1", "catalog1"): [parse_one(f"rls_{table} = 1")]
+            for table in read_counts
+        },
+        RLSMethod.AS_SUBQUERY,
+    )
+    output = statement.format()
+    for table, count in read_counts.items():
+        assert output.count(f"rls_{table} = 1") == count
 
 
 def test_rls_invalid_method(mocker: MockerFixture) -> None:
@@ -3302,6 +3431,26 @@ SELECT
 FROM tbl_a AS _t0(c1, c2)
 WHERE
   tbl_a.id = 42
+            """.strip(),
+        ),
+        # A table heading a parenthesised join is a read, but its parent is the
+        # ``Subquery`` wrapping the join rather than a ``From`` or ``Join``, so the
+        # predicate method has nowhere to hang the clause and leaves it. This stays
+        # fail-closed: the subquery method, which replaces the node itself, does filter
+        # it. Documented here so a future change to the parenthesised-join shape is
+        # noticed.
+        (
+            "SELECT * FROM (some_table JOIN other_table "
+            "ON some_table.id = other_table.id)",
+            {Table("some_table", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM (
+  some_table
+    JOIN other_table
+      ON some_table.id = other_table.id
+)
             """.strip(),
         ),
     ],

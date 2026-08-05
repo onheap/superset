@@ -290,10 +290,7 @@ class RLSAsPredicateTransformer(RLSTransformer):
     databases without support for subqueries.
     """
 
-    def __call__(self, node: exp.Expression) -> exp.Expression:
-        if not isinstance(node, exp.Table):
-            return node
-
+    def __call__(self, node: exp.Table) -> exp.Expression:
         predicate = self.get_predicate(node)
         if not predicate:
             return node
@@ -352,10 +349,7 @@ class RLSAsSubqueryTransformer(RLSTransformer):
     all databases.
     """
 
-    def __call__(self, node: exp.Expression) -> exp.Expression:
-        if not isinstance(node, exp.Table):
-            return node
-
+    def __call__(self, node: exp.Table) -> exp.Expression:
         if predicate := self.get_predicate(node):
             if existing_alias := node.args.get("alias"):
                 # Carry the parsed node over rather than rebuilding from ``node.alias``:
@@ -1411,7 +1405,40 @@ class SQLStatement(BaseSQLStatement[exp.Expression]):
             raise ValueError(f"Invalid RLS method: {method}")
 
         transformer = transformers[method](catalog, schema, predicates)
-        self._parsed = self._parsed.transform(transformer)
+
+        # Rewrite the real table reads in place rather than every ``exp.Table`` the
+        # tree happens to hold. The reads are enumerated exactly as the authorization
+        # layer enumerates them (see ``extract_tables_from_statement``): each
+        # ``exp.Table`` a scope reads that ``is_cte`` does not resolve to a CTE. Sharing
+        # that enumeration keeps the filtered set equal to the authorized set, so a read
+        # cannot be filtered without being access-checked, nor checked without being
+        # filtered. A CTE reference that merely shares a rule's table name is not a read
+        # here, so it keeps its own projection instead of being filtered by a column the
+        # projection need not carry.
+        seen: set[int] = set()
+        reads: list[exp.Table] = []
+        for scope in traverse_scope(self._parsed):
+            for source in scope.sources.values():
+                if (
+                    isinstance(source, exp.Table)
+                    and not is_cte(source, scope)
+                    and id(source) not in seen
+                ):
+                    # Dedupe by identity: a correlated ``LATERAL`` reaches the same
+                    # outer-table node through two scopes and must be wrapped once.
+                    # Distinct reads of one table (two references, a self-join) are
+                    # separate nodes and are each kept.
+                    seen.add(id(source))
+                    reads.append(source)
+
+        # Wrap the deepest reads first. A table heading a parenthesised join carries
+        # that join in its own ``args``; wrapping an ancestor first would copy the
+        # descendant read into the ancestor's subquery and then replace a node no longer
+        # attached to the live tree, dropping the descendant's filter.
+        for node in sorted(reads, key=lambda read: read.depth, reverse=True):
+            replacement = transformer(node)
+            if replacement is not node:
+                node.replace(replacement)
 
 
 class KQLSplitState(enum.Enum):
