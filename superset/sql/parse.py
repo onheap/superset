@@ -1419,15 +1419,22 @@ class SQLStatement(BaseSQLStatement[exp.Expression]):
         reads: list[exp.Table] = []
         for scope in traverse_scope(self._parsed):
             for source in scope.sources.values():
+                # ``not is_cte`` is redundant with the ``isinstance`` check today --
+                # sqlglot files a CTE reference as a ``Scope``, not an ``exp.Table`` --
+                # but is kept so this enumeration stays byte-for-byte the one
+                # ``extract_tables_from_statement`` uses, and stays correct should
+                # sqlglot ever surface a CTE reference as a table.
                 if (
                     isinstance(source, exp.Table)
                     and not is_cte(source, scope)
                     and id(source) not in seen
                 ):
-                    # Dedupe by identity: a correlated ``LATERAL`` reaches the same
-                    # outer-table node through two scopes and must be wrapped once.
-                    # Distinct reads of one table (two references, a self-join) are
-                    # separate nodes and are each kept.
+                    # Wrap each read node once. A correlated ``LATERAL`` reaches the
+                    # same outer-table node through two scopes; deduping by identity
+                    # skips the redundant second pass (and even without it the second
+                    # ``replace`` would be a harmless no-op, since the first detaches
+                    # the node). Distinct reads of one table -- two references, a
+                    # self-join -- are separate nodes and are each kept.
                     seen.add(id(source))
                     reads.append(source)
 

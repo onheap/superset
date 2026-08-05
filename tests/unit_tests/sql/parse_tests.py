@@ -3019,6 +3019,18 @@ def test_rls_subquery_transformer(
             {"t": 2},
         ),
         ("SELECT * FROM (SELECT * FROM t) AS x", {"t": 1}),
+        # Pins the deepest-first ordering. The parenthesised join head ``t`` carries the
+        # join to ``u`` in its own args, so ``u`` must be wrapped before ``t``; wrapping
+        # ``t`` first would copy ``u`` into ``t``'s subquery and drop ``u``'s filter.
+        # Flipping the sort to ``reverse=False`` makes this case fail.
+        ("SELECT * FROM (t JOIN u ON t.id = u.id)", {"t": 1, "u": 1}),
+        # A correlated ``LATERAL`` reaches the outer read through two scopes; it is
+        # wrapped once, and the lateral's own read is wrapped once.
+        (
+            "SELECT * FROM some_table, LATERAL ("
+            "SELECT * FROM other_table WHERE other_table.x = some_table.x) t",
+            {"some_table": 1, "other_table": 1},
+        ),
     ],
 )
 def test_rls_subquery_filters_every_authorized_read(
