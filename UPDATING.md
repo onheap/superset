@@ -39,22 +39,27 @@ WITH orders AS (SELECT * FROM orders) SELECT * FROM orders
 WITH q1 AS (SELECT key FROM q2), q2 AS (SELECT 1 AS key) SELECT * FROM q1
 ```
 
-More tables are reported, so such a query may be rejected where it previously ran: the
-read is filtered when `RLS_IN_SQLLAB` is enabled, matched against
-`DISALLOWED_SQL_TABLES` (which covers `information_schema` views for several engines by
-default), and requires dataset access under `raise_for_access(force_dataset_match=True)`,
-which SQL Lab uses. Rename the CTE so it differs from the tables the query reads to
-restore the previous behavior.
+Each read is now reported, so it is filtered when `RLS_IN_SQLLAB` is enabled, checked
+against `DISALLOWED_SQL_TABLES` (whose defaults list PostgreSQL's system catalogs and
+`information_schema` views, plus a few MySQL and MSSQL system tables), and requires dataset
+access under `raise_for_access(force_dataset_match=True)`, which SQL Lab uses. A query that
+previously ran — reading those rows unfiltered — may now be filtered or rejected. There is
+no opt-out: the previous behavior was a row-level-security bypass.
 
-Two consequences worth knowing before you upgrade:
+The rewrite now filters each real table read in place rather than matching rules by table
+name, so a CTE that shares a name with a table the query reads is no longer wrapped along
+with the real read. `WITH orders AS (SELECT id FROM orders) SELECT * FROM orders` filters
+the base-table read inside the CTE and leaves the CTE reference untouched, where the
+name-matching rewrite wrapped both and the database rejected the query whenever the CTE's
+projection omitted the rule's column. One case is still rejected: on a case-insensitive
+engine a reference whose letter case differs from the CTE's binds to the CTE, yet is
+reported and wrapped as a table; if the CTE's projection lacks the column the rule names,
+the database rejects the query. Rename the CTE to avoid it. (Fail-closed — the query
+errors, it does not leak.)
 
-- A reference whose letter case differs from the CTE's is reported as a table, on every
-  engine. On a case-insensitive engine the reference is the CTE, so the rule's predicate
-  is applied to the CTE's projection; if that projection lacks the column the rule names,
-  the database rejects the query. Renaming the CTE resolves it.
-- A pivoted CTE reference is no longer reported as a table, so an access check that
-  previously fired on the CTE's name no longer does. The table the CTE reads is still
-  reported and still checked.
+A pivoted CTE reference is no longer reported as a table, so an access check that
+previously fired on the CTE's name no longer does. The table the CTE reads is still
+reported and still checked.
 
 ### Table aliases keep their quoting through the row-level security rewrite
 
