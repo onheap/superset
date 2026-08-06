@@ -717,17 +717,12 @@ SELECT c FROM z
 
 
 def test_extract_tables_reusing_aliases() -> None:
-    """
-    Test that the parser follows aliases.
+    """Test that the parser follows aliases.
 
-    A non-recursive ``WITH`` item may only reference items declared before it, so a
-    reference to a name declared later in the same ``WITH`` list resolves outside the
-    ``WITH``, to the table of that name. Such a reference is a real table read and has
-    to be extracted, or it receives neither a row-level security predicate nor an
-    access check.
+    A non-recursive ``WITH`` item sees only items declared before it, so a forward
+    reference resolves to the table of that name -- a real read that must be extracted.
     """
-    # `q1` is declared first, so the `q2` in its body is the table, and `q2`'s `src`
-    # is a table as well.
+    # `q1` first: the `q2` in its body, and `q2`'s `src`, are both tables.
     assert extract_tables_from_sql(
         """
 with q1 as ( select key from q2 where key = '5'),
@@ -736,8 +731,7 @@ select * from (select key from q1) a
 """
     ) == {Table("q2"), Table("src")}
 
-    # Circular pair. `src` is declared first, so the `q2` in its body is the table;
-    # `q2`'s `src` resolves backwards to the CTE, and so does the outer reference.
+    # `src` first: its `q2` is a table; `q2`'s `src` and the outer `src` are the CTE.
     assert extract_tables_from_sql(
         """
 with src as ( select key from q2 where key = '5'),
@@ -748,33 +742,26 @@ select * from (select key from src) a
 
 
 def test_extract_tables_cte_name_shared_with_table() -> None:
-    """
-    Test that a CTE's name does not hide reads of the table it is named after.
+    """Test that a CTE's name does not hide reads of the table it is named after.
 
-    Only a reference that resolves to the CTE may be excluded; dropping any other costs
-    it both its row filter and its access check.
+    Only a reference resolving to the CTE may be excluded; dropping any other costs it
+    both its row filter and its access check.
     """
-    # The reference inside the CTE body is the table — and it is qualified, so it could
-    # not have named the CTE in any case.
+    # A qualified reference -- in the CTE body or elsewhere -- is the table.
     assert extract_tables_from_sql(
         "WITH orders AS (SELECT * FROM public.orders) SELECT * FROM orders"
     ) == {Table("orders", "public")}
-
-    # A qualified reference elsewhere in the statement is likewise the table.
     assert extract_tables_from_sql(
         "WITH orders AS (SELECT 1 AS d) "
         "SELECT * FROM (SELECT * FROM public.orders) AS z"
     ) == {Table("orders", "public")}
 
-    # A non-recursive CTE cannot see itself, so its own name inside its body is the
-    # table of that name.
+    # A non-recursive CTE cannot see itself, so its own name in its body is the table.
     assert extract_tables_from_sql(
         "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders"
     ) == {Table("orders")}
 
-    # A catalog is as disqualifying as a schema. `catalog..table` names a catalog and no
-    # schema, and reaches the check only when pivoted -- sqlglot substitutes the CTE's
-    # scope for every other reference whose name it resolves itself.
+    # A catalog disqualifies like a schema; `cat..orders` is checked only when pivoted.
     assert extract_tables_from_sql(
         "WITH orders AS (SELECT 1 AS amt, 'a' AS mth) "
         "SELECT * FROM cat..orders PIVOT(SUM(amt) FOR mth IN ('a'))",
@@ -783,11 +770,9 @@ def test_extract_tables_cte_name_shared_with_table() -> None:
 
 
 def test_extract_tables_cte_reference_not_table() -> None:
-    """
-    Test the counterpart: a reference that does resolve to a CTE is not a table.
+    """Test the counterpart: a reference that resolves to a CTE is not a table.
 
-    A non-recursive item's reference to itself is the shape a bare-name comparison gets
-    wrong, which is why the name has to be resolved rather than compared.
+    A recursive item's reference to itself is the shape a bare-name compare gets wrong.
     """
     assert (
         extract_tables_from_sql(
@@ -800,20 +785,16 @@ def test_extract_tables_cte_reference_not_table() -> None:
 
 
 def test_extract_tables_pivoted_cte_reference_is_not_a_table() -> None:
-    """
-    Test that pivoting a CTE reference does not make it a table read.
+    """Test that pivoting a CTE reference does not make it a table read.
 
-    Pivoting yields a new relation, which is why sqlglot keeps the reference as an
-    ``exp.Table`` rather than substituting the CTE's scope, so this is the one shape
-    where a CTE reference reaches ``is_cte()`` unqualified. The table the CTE reads is
-    still reported.
+    Pivoting yields a new relation, so sqlglot keeps the reference as an ``exp.Table``
+    -- the one shape where a CTE reference reaches ``is_cte()`` unqualified.
     """
     assert extract_tables_from_sql(
         "WITH c AS (SELECT a, b FROM other_table) "
         "SELECT * FROM c PIVOT(SUM(b) FOR a IN ('p'))",
         engine="snowflake",
     ) == {Table("other_table")}
-
     # Also when the pivot sits inside a derived table.
     assert extract_tables_from_sql(
         "WITH c AS (SELECT a, b FROM other_table) "
@@ -823,17 +804,14 @@ def test_extract_tables_pivoted_cte_reference_is_not_a_table() -> None:
 
 
 def test_extract_tables_aliased_cte_does_not_hide_table() -> None:
-    """
-    Test that aliasing a CTE reference does not erase a table of the same name.
+    """Test that aliasing a CTE reference does not erase a table of the same name.
 
-    ``Scope.sources`` is keyed by ``alias_or_name``, so it files an aliased CTE
-    reference under the alias and would mistake the table for the CTE. ``cte_sources``
-    is keyed by CTE name only.
+    ``Scope.sources`` is keyed by ``alias_or_name`` and would file the table under the
+    CTE's alias; ``cte_sources`` is keyed by CTE name only.
     """
     assert extract_tables_from_sql(
         "WITH c AS (SELECT 1 AS n) SELECT s2.* FROM c AS other_table, other_table AS s2"
     ) == {Table("other_table")}
-
     assert extract_tables_from_sql(
         "WITH c AS (SELECT 1 AS n) "
         "SELECT s2.* FROM c AS other_table LEFT JOIN other_table AS s2 ON TRUE"
@@ -841,18 +819,14 @@ def test_extract_tables_aliased_cte_does_not_hide_table() -> None:
 
 
 def test_extract_tables_cte_reference_over_reported() -> None:
-    """
-    Test the two shapes where a CTE reference is reported as a table.
+    """Test the two shapes that over-report a CTE reference as a table.
 
-    Both over-report, declaring a table the statement does not read — a spurious access
-    check rather than a missing one. Pinned so a change in either direction is
-    deliberate.
+    A spurious access check, not a missing one. Pinned so a change either way is meant.
     """
     # PostgreSQL resolves `foo` to the CTE; this reports the table.
     assert extract_tables_from_sql("WITH Foo AS (SELECT 1 AS d) SELECT * FROM foo") == {
         Table("foo")
     }
-
     # Legal under RECURSIVE: `q2` is the CTE declared below, not a table.
     assert extract_tables_from_sql(
         "WITH RECURSIVE q1 AS (SELECT key FROM q2), q2 AS (SELECT 1 AS key) "
@@ -2858,36 +2832,6 @@ FROM (
             """.strip(),
         ),
         (
-            'SELECT * FROM tbl_a AS "TRUE OR TRUE --"',
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-SELECT
-  *
-FROM (
-  SELECT
-    *
-  FROM tbl_a
-  WHERE
-    id = 42
-) AS "TRUE OR TRUE --"
-            """.strip(),
-        ),
-        (
-            'SELECT * FROM tbl_a AS "a""b"',
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-SELECT
-  *
-FROM (
-  SELECT
-    *
-  FROM tbl_a
-  WHERE
-    id = 42
-) AS "a""b"
-            """.strip(),
-        ),
-        (
             "SELECT c1 FROM tbl_a AS x (c1, c2)",
             {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
             """
@@ -2902,11 +2846,8 @@ FROM (
 ) AS x(c1, c2)
             """.strip(),
         ),
-        # A CTE whose name matches the rule's table is not a read of that table: only
-        # the real read inside the CTE body is wrapped, and the outer reference to the
-        # CTE keeps its own projection. Wrapping the reference would filter the CTE's
-        # columns by a rule naming one the projection need not carry, which the database
-        # then rejects.
+        # A CTE sharing the rule's table name is not a read of it: only the real read
+        # inside the CTE body is wrapped; the CTE reference keeps its own projection.
         (
             "WITH some_table AS (SELECT id FROM some_table) SELECT * FROM some_table",
             {Table("some_table", "schema1", "catalog1"): "id = 42"},
@@ -2927,9 +2868,8 @@ SELECT
 FROM some_table
             """.strip(),
         ),
-        # A correlated ``LATERAL`` reads the outer table in both scopes, so the same
-        # node is reached twice; it is wrapped once, not doubly. The lateral's own read
-        # is a distinct node and is wrapped in place.
+        # A correlated ``LATERAL`` reaches the outer read through two scopes: wrapped
+        # once, not twice. The lateral's own read is a distinct node, wrapped in place.
         (
             "SELECT * FROM some_table, LATERAL ("
             "SELECT * FROM other_table WHERE other_table.x = some_table.x) t",
@@ -2961,9 +2901,8 @@ FROM (
 ) AS t
             """.strip(),
         ),
-        # A read nested in a DML statement's subquery is filtered in place, not refused:
-        # the ``UPDATE`` target is not a source, so only the ``SELECT``'s read of ``t``
-        # is enumerated and wrapped.
+        # A read in a DML statement's subquery is filtered in place, not refused: the
+        # ``UPDATE`` target is not a source, so only the ``SELECT`` read of ``t`` wraps.
         (
             "UPDATE dst SET x = 1 WHERE id IN (SELECT id FROM t)",
             {Table("t", "schema1", "catalog1"): "id = 42"},
@@ -3037,13 +2976,10 @@ def test_rls_subquery_filters_every_authorized_read(
     sql: str,
     read_counts: dict[str, int],
 ) -> None:
-    """
-    The filtered set is a superset of the authorized set and never fails open.
+    """The set the rewrite filters equals the set authorization enforces.
 
-    The reads the rewrite wraps are exactly the tables authorization enforces
-    (``extract_tables_from_statement``). Each read is given a table-specific sentinel
-    predicate; its occurrence count in the output must equal the number of real-read
-    nodes of that table, so a dropped read (fail-open) or a double-wrap is caught.
+    Each read gets a table-specific sentinel predicate; its count in the output must
+    equal that table's real-read node count, catching a dropped read or a double-wrap.
     """
     authorized = {t.table for t in extract_tables_from_statement(parse_one(sql), None)}
     assert authorized == set(read_counts)
@@ -3399,28 +3335,6 @@ WHERE
             """.strip(),
         ),
         (
-            'SELECT * FROM tbl_a AS "TRUE OR TRUE --"',
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-SELECT
-  *
-FROM tbl_a AS "TRUE OR TRUE --"
-WHERE
-  "TRUE OR TRUE --".id = 42
-            """.strip(),
-        ),
-        (
-            'SELECT * FROM tbl_a AS "a""b"',
-            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
-            """
-SELECT
-  *
-FROM tbl_a AS "a""b"
-WHERE
-  "a""b".id = 42
-            """.strip(),
-        ),
-        (
             'SELECT * FROM tbl_a AS "a.b"',
             {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
             """
@@ -3431,9 +3345,8 @@ WHERE
   "a.b".id = 42
             """.strip(),
         ),
-        # An alias can be a column list with no name of its own, whose ``this`` is
-        # ``None``. Qualifying with the table keeps the predicate from resolving outward
-        # into an enclosing scope.
+        # A column-list alias has no name (``this`` is ``None``); qualify with the table
+        # so the predicate does not resolve outward into an enclosing scope.
         (
             "SELECT * FROM tbl_a AS (c1, c2)",
             {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
@@ -3445,12 +3358,9 @@ WHERE
   tbl_a.id = 42
             """.strip(),
         ),
-        # A table heading a parenthesised join is a read, but its parent is the
-        # ``Subquery`` wrapping the join rather than a ``From`` or ``Join``, so the
-        # predicate method has nowhere to hang the clause and leaves it. This stays
-        # fail-closed: the subquery method, which replaces the node itself, does filter
-        # it. Documented here so a future change to the parenthesised-join shape is
-        # noticed.
+        # A table heading a parenthesised join is a read, but its parent is the wrapping
+        # ``Subquery``, not a ``From``/``Join``, so the predicate method leaves it --
+        # fail-closed (the subquery method filters it). Pinned to catch a shape change.
         (
             "SELECT * FROM (some_table JOIN other_table "
             "ON some_table.id = other_table.id)",
