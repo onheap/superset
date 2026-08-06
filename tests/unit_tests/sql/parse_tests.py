@@ -719,26 +719,145 @@ SELECT c FROM z
 def test_extract_tables_reusing_aliases() -> None:
     """
     Test that the parser follows aliases.
+
+    A non-recursive ``WITH`` item may only reference items declared before it, so a
+    reference to a name declared later in the same ``WITH`` list resolves outside the
+    ``WITH``, to the table of that name. Such a reference is a real table read and has
+    to be extracted, or it receives neither a row-level security predicate nor an
+    access check.
     """
+    # `q1` is declared first, so the `q2` in its body is the table, and `q2`'s `src`
+    # is a table as well.
     assert extract_tables_from_sql(
         """
 with q1 as ( select key from q2 where key = '5'),
 q2 as ( select key from src where key = '5')
 select * from (select key from q1) a
 """
-    ) == {Table("src")}
+    ) == {Table("q2"), Table("src")}
 
-    # weird query with circular dependency
-    assert (
-        extract_tables_from_sql(
-            """
+    # Circular pair. `src` is declared first, so the `q2` in its body is the table;
+    # `q2`'s `src` resolves backwards to the CTE, and so does the outer reference.
+    assert extract_tables_from_sql(
+        """
 with src as ( select key from q2 where key = '5'),
 q2 as ( select key from src where key = '5')
 select * from (select key from src) a
 """
+    ) == {Table("q2")}
+
+
+def test_extract_tables_cte_name_shared_with_table() -> None:
+    """
+    Test that a CTE's name does not hide reads of the table it is named after.
+
+    Only a reference that resolves to the CTE may be excluded; dropping any other costs
+    it both its row filter and its access check.
+    """
+    # The reference inside the CTE body is the table — and it is qualified, so it could
+    # not have named the CTE in any case.
+    assert extract_tables_from_sql(
+        "WITH orders AS (SELECT * FROM public.orders) SELECT * FROM orders"
+    ) == {Table("orders", "public")}
+
+    # A qualified reference elsewhere in the statement is likewise the table.
+    assert extract_tables_from_sql(
+        "WITH orders AS (SELECT 1 AS d) "
+        "SELECT * FROM (SELECT * FROM public.orders) AS z"
+    ) == {Table("orders", "public")}
+
+    # A non-recursive CTE cannot see itself, so its own name inside its body is the
+    # table of that name.
+    assert extract_tables_from_sql(
+        "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders"
+    ) == {Table("orders")}
+
+    # A catalog is as disqualifying as a schema. `catalog..table` names a catalog and no
+    # schema, and reaches the check only when pivoted -- sqlglot substitutes the CTE's
+    # scope for every other reference whose name it resolves itself.
+    assert extract_tables_from_sql(
+        "WITH orders AS (SELECT 1 AS amt, 'a' AS mth) "
+        "SELECT * FROM cat..orders PIVOT(SUM(amt) FOR mth IN ('a'))",
+        engine="snowflake",
+    ) == {Table("orders", None, "cat")}
+
+
+def test_extract_tables_cte_reference_not_table() -> None:
+    """
+    Test the counterpart: a reference that does resolve to a CTE is not a table.
+
+    A non-recursive item's reference to itself is the shape a bare-name comparison gets
+    wrong, which is why the name has to be resolved rather than compared.
+    """
+    assert (
+        extract_tables_from_sql(
+            "WITH RECURSIVE t AS ("
+            "SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5"
+            ") SELECT * FROM t"
         )
         == set()
     )
+
+
+def test_extract_tables_pivoted_cte_reference_is_not_a_table() -> None:
+    """
+    Test that pivoting a CTE reference does not make it a table read.
+
+    Pivoting yields a new relation, which is why sqlglot keeps the reference as an
+    ``exp.Table`` rather than substituting the CTE's scope, so this is the one shape
+    where a CTE reference reaches ``is_cte()`` unqualified. The table the CTE reads is
+    still reported.
+    """
+    assert extract_tables_from_sql(
+        "WITH c AS (SELECT a, b FROM other_table) "
+        "SELECT * FROM c PIVOT(SUM(b) FOR a IN ('p'))",
+        engine="snowflake",
+    ) == {Table("other_table")}
+
+    # Also when the pivot sits inside a derived table.
+    assert extract_tables_from_sql(
+        "WITH c AS (SELECT a, b FROM other_table) "
+        "SELECT * FROM (SELECT * FROM c PIVOT(SUM(b) FOR a IN ('p'))) AS z",
+        engine="snowflake",
+    ) == {Table("other_table")}
+
+
+def test_extract_tables_aliased_cte_does_not_hide_table() -> None:
+    """
+    Test that aliasing a CTE reference does not erase a table of the same name.
+
+    ``Scope.sources`` is keyed by ``alias_or_name``, so it files an aliased CTE
+    reference under the alias and would mistake the table for the CTE. ``cte_sources``
+    is keyed by CTE name only.
+    """
+    assert extract_tables_from_sql(
+        "WITH c AS (SELECT 1 AS n) SELECT s2.* FROM c AS other_table, other_table AS s2"
+    ) == {Table("other_table")}
+
+    assert extract_tables_from_sql(
+        "WITH c AS (SELECT 1 AS n) "
+        "SELECT s2.* FROM c AS other_table LEFT JOIN other_table AS s2 ON TRUE"
+    ) == {Table("other_table")}
+
+
+def test_extract_tables_cte_reference_over_reported() -> None:
+    """
+    Test the two shapes where a CTE reference is reported as a table.
+
+    Both over-report, declaring a table the statement does not read — a spurious access
+    check rather than a missing one. Pinned so a change in either direction is
+    deliberate.
+    """
+    # PostgreSQL resolves `foo` to the CTE; this reports the table.
+    assert extract_tables_from_sql("WITH Foo AS (SELECT 1 AS d) SELECT * FROM foo") == {
+        Table("foo")
+    }
+
+    # Legal under RECURSIVE: `q2` is the CTE declared below, not a table.
+    assert extract_tables_from_sql(
+        "WITH RECURSIVE q1 AS (SELECT key FROM q2), q2 AS (SELECT 1 AS key) "
+        "SELECT * FROM q1"
+    ) == {Table("q2")}
 
 
 def test_extract_tables_multistatement() -> None:
@@ -2723,6 +2842,66 @@ FROM (
 LIMIT 100
         """.strip(),
         ),
+        (
+            'SELECT * FROM tbl_a AS "x AND 1 = 0 OR 1 = 1"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM (
+  SELECT
+    *
+  FROM tbl_a
+  WHERE
+    id = 42
+) AS "x AND 1 = 0 OR 1 = 1"
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "TRUE OR TRUE --"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM (
+  SELECT
+    *
+  FROM tbl_a
+  WHERE
+    id = 42
+) AS "TRUE OR TRUE --"
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "a""b"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM (
+  SELECT
+    *
+  FROM tbl_a
+  WHERE
+    id = 42
+) AS "a""b"
+            """.strip(),
+        ),
+        (
+            "SELECT c1 FROM tbl_a AS x (c1, c2)",
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  c1
+FROM (
+  SELECT
+    *
+  FROM tbl_a
+  WHERE
+    id = 42
+) AS x(c1, c2)
+            """.strip(),
+        ),
     ],
 )
 def test_rls_subquery_transformer(
@@ -3065,6 +3244,64 @@ INSERT INTO some_table (
 )
 VALUES
   (1, 2)
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "x AND 1 = 0 OR 1 = 1"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS "x AND 1 = 0 OR 1 = 1"
+WHERE
+  "x AND 1 = 0 OR 1 = 1".id = 42
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "TRUE OR TRUE --"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS "TRUE OR TRUE --"
+WHERE
+  "TRUE OR TRUE --".id = 42
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "a""b"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS "a""b"
+WHERE
+  "a""b".id = 42
+            """.strip(),
+        ),
+        (
+            'SELECT * FROM tbl_a AS "a.b"',
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS "a.b"
+WHERE
+  "a.b".id = 42
+            """.strip(),
+        ),
+        # An alias can be a column list with no name of its own, whose ``this`` is
+        # ``None``. Qualifying with the table keeps the predicate from resolving outward
+        # into an enclosing scope.
+        (
+            "SELECT * FROM tbl_a AS (c1, c2)",
+            {Table("tbl_a", "schema1", "catalog1"): "id = 42"},
+            """
+SELECT
+  *
+FROM tbl_a AS _t0(c1, c2)
+WHERE
+  tbl_a.id = 42
             """.strip(),
         ),
     ],

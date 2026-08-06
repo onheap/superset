@@ -298,9 +298,12 @@ class RLSAsPredicateTransformer(RLSTransformer):
         if not predicate:
             return node
 
-        # qualify columns with table name
+        # Qualify with the parsed alias node, not the ``node.alias`` string (which drops
+        # quoting and could inject SQL); use the table when the alias has no name.
+        table_alias = node.args.get("alias")
+        qualifier = (table_alias and table_alias.this) or node.this
         for column in predicate.find_all(exp.Column):
-            column.set("table", node.alias or node.this)
+            column.set("table", qualifier.copy())
 
         if isinstance(node.parent, exp.From):
             select = node.parent.parent
@@ -351,8 +354,10 @@ class RLSAsSubqueryTransformer(RLSTransformer):
             return node
 
         if predicate := self.get_predicate(node):
-            if node.alias:
-                alias = node.alias
+            if existing_alias := node.args.get("alias"):
+                # Reuse the parsed alias node, not the ``node.alias`` string: that drops
+                # quoting (SQL in an alias re-emits as SQL) and the column-alias list.
+                alias = existing_alias
             else:
                 # Use just the table name (not schema-qualified) so that
                 # column references like ``table.column`` still resolve after
@@ -1998,24 +2003,21 @@ def extract_tables_from_statement(
 
 def is_cte(source: exp.Table, scope: Scope) -> bool:
     """
-    Is the source a CTE?
+    Does this reference resolve to a CTE rather than to a real table?
 
-    CTEs in the parent scope look like tables (and are represented by
-    exp.Table objects), but should not be considered as such;
-    otherwise a user with access to table `foo` could access any table
-    with a query like this:
-
-        WITH foo AS (SELECT * FROM target_table) SELECT * FROM foo
-
+    A CTE reference is also an ``exp.Table``, so it must be excluded from a statement's
+    read tables, or a rule on a table could be evaded by wrapping it in a same-named
+    CTE. Resolve the name through ``Scope.cte_sources`` (not ``Scope.sources``, keyed by
+    ``alias_or_name``, which would hide a real table sharing a CTE's alias); a qualified
+    reference (schema or catalog) is always a table. Where sqlglot registers a name
+    differently than SQL scopes it (letter-case, a ``WITH RECURSIVE`` self/forward
+    reference), this errs toward reporting a table -- a spurious check, not a leak.
     """
-    parent_sources = scope.parent.sources if scope.parent else {}
-    ctes_in_scope = {
-        name
-        for name, parent_scope in parent_sources.items()
-        if isinstance(parent_scope, Scope) and parent_scope.scope_type == ScopeType.CTE
-    }
+    if source.db or source.catalog:
+        return False
 
-    return source.name in ctes_in_scope
+    resolved = scope.cte_sources.get(source.name)
+    return isinstance(resolved, Scope) and resolved.scope_type == ScopeType.CTE
 
 
 T = TypeVar("T", str, None)

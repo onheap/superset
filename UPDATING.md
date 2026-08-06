@@ -24,6 +24,49 @@ assists people when migrating to a new version.
 
 ## Next
 
+### Queries naming a CTE after a table they also read may now be rejected
+
+`extract_tables_from_statement()` decided whether a reference was a CTE by matching its
+bare name against the enclosing scope's CTE names; it now resolves the name through
+`Scope.cte_sources`. Three kinds of real table read were mistaken for a CTE reference and
+dropped from the statement's table set, so they received neither a row-level security
+predicate nor an access check — a qualified reference, a non-recursive CTE's own name
+inside its body, and a forward reference in a non-recursive `WITH`:
+
+```sql
+WITH orders AS (SELECT 1 AS d) SELECT * FROM (SELECT * FROM public.orders) AS z
+WITH orders AS (SELECT * FROM orders) SELECT * FROM orders
+WITH q1 AS (SELECT key FROM q2), q2 AS (SELECT 1 AS key) SELECT * FROM q1
+```
+
+More tables are reported, so such a query may be rejected where it previously ran: the
+read is filtered when `RLS_IN_SQLLAB` is enabled, matched against
+`DISALLOWED_SQL_TABLES` (which covers `information_schema` views for several engines by
+default), and requires dataset access under `raise_for_access(force_dataset_match=True)`,
+which SQL Lab uses. Rename the CTE so it differs from the tables the query reads to
+restore the previous behavior.
+
+Two consequences worth knowing before you upgrade:
+
+- A reference whose letter case differs from the CTE's is reported as a table, on every
+  engine. On a case-insensitive engine the reference is the CTE, so the rule's predicate
+  is applied to the CTE's projection; if that projection lacks the column the rule names,
+  the database rejects the query. Renaming the CTE resolves it.
+- A pivoted CTE reference is no longer reported as a table, so an access check that
+  previously fired on the CTE's name no longer does. The table the CTE reads is still
+  reported and still checked.
+
+### Table aliases keep their quoting through the row-level security rewrite
+
+Both RLS transformers took the table alias as a string with its quoting stripped and
+emitted it verbatim, so an alias containing SQL became part of the rewritten statement.
+They now carry the parsed identifier. A column alias list (`FROM t AS x (c1, c2)`) also
+survives the rewrite instead of being dropped, so a query selecting `c1` resolves it
+against the list rather than against the table. Emitted SQL is unchanged for an *unquoted*
+plain identifier; a quoted one keeps its quoting, which is the fix. This also repairs
+row-level security for any aliased table on Snowflake, and for at least one statement
+shape on MSSQL, where the rewrite previously raised `AttributeError`.
+
 ### Principal listing APIs now honour related-field filters
 
 Two authorization-related listing behaviors changed for API clients. Neither
