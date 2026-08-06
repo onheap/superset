@@ -24,14 +24,14 @@ assists people when migrating to a new version.
 
 ## Next
 
-### Table reads masked by a same-named CTE are now row-level-security filtered
+### Row-level security now filters table reads a same-named CTE used to hide
 
 `extract_tables_from_statement()` decided whether a reference was a CTE by matching its
 bare name against the enclosing scope's CTE names; it now resolves the name through
-`Scope.cte_sources`. Three kinds of real table read were mistaken for a CTE reference and
-dropped from the statement's table set, so they received neither a row-level security
-predicate nor an access check — a qualified reference, a non-recursive CTE's own name
-inside its body, and a forward reference in a non-recursive `WITH`:
+`Scope.cte_sources`. Three kinds of real table read whose bare name collided with a CTE's
+were mistaken for the CTE and dropped from a statement's tables, so they were neither
+RLS-filtered nor access-checked: a schema- or catalog-qualified reference, a non-recursive
+CTE's own name inside its body, and a forward reference to a later `WITH` item.
 
 ```sql
 WITH orders AS (SELECT 1 AS d) SELECT * FROM (SELECT * FROM public.orders) AS z
@@ -39,38 +39,20 @@ WITH orders AS (SELECT * FROM orders) SELECT * FROM orders
 WITH q1 AS (SELECT key FROM q2), q2 AS (SELECT 1 AS key) SELECT * FROM q1
 ```
 
-Each read is now reported, so it is filtered when `RLS_IN_SQLLAB` is enabled, checked
-against `DISALLOWED_SQL_TABLES` (whose defaults list PostgreSQL's system catalogs and
-`information_schema` views, plus a few MySQL and MSSQL system tables), and requires dataset
-access under `raise_for_access(force_dataset_match=True)`, which SQL Lab uses. A query that
-previously ran — reading those rows unfiltered — may now be filtered or rejected. There is
-no opt-out: the previous behavior was a row-level-security bypass.
-
-The rewrite now filters each real table read in place rather than matching rules by table
-name, so a CTE that shares a name with a table the query reads is no longer wrapped along
-with the real read. `WITH orders AS (SELECT id FROM orders) SELECT * FROM orders` filters
-the base-table read inside the CTE and leaves the CTE reference untouched, where the
-name-matching rewrite wrapped both and the database rejected the query whenever the CTE's
-projection omitted the rule's column. One case is still rejected: on a case-insensitive
-engine a reference whose letter case differs from the CTE's binds to the CTE, yet is
-reported and wrapped as a table; if the CTE's projection lacks the column the rule names,
-the database rejects the query. Rename the CTE to avoid it. (Fail-closed — the query
-errors, it does not leak.)
-
-A pivoted CTE reference is no longer reported as a table, so an access check that
-previously fired on the CTE's name no longer does. The table the CTE reads is still
-reported and still checked.
+Each read is now reported, so it is filtered when `RLS_IN_SQLLAB` is enabled, matched
+against `DISALLOWED_SQL_TABLES`, and requires dataset access under
+`raise_for_access(force_dataset_match=True)`. A query that previously ran, reading those
+rows unfiltered, may now be filtered or rejected. There is no opt-out — the previous
+behavior was a row-level-security bypass.
 
 ### Table aliases keep their quoting through the row-level security rewrite
 
 Both RLS transformers took the table alias as a string with its quoting stripped and
-emitted it verbatim, so an alias containing SQL became part of the rewritten statement.
-They now carry the parsed identifier. A column alias list (`FROM t AS x (c1, c2)`) also
-survives the rewrite instead of being dropped, so a query selecting `c1` resolves it
-against the list rather than against the table. Emitted SQL is unchanged for an *unquoted*
-plain identifier; a quoted one keeps its quoting, which is the fix. This also repairs
-row-level security for any aliased table on Snowflake, and for at least one statement
-shape on MSSQL, where the rewrite previously raised `AttributeError`.
+emitted it verbatim; they now carry the parsed identifier. Emitted SQL is unchanged for an
+unquoted identifier; a quoted one keeps its quoting, and a column-alias list
+(`FROM t AS x (c1, c2)`) survives the rewrite instead of being dropped. This repairs
+row-level security for any aliased table on Snowflake, and for at least one statement shape
+on MSSQL where the rewrite previously raised `AttributeError`.
 
 ### Principal listing APIs now honour related-field filters
 
