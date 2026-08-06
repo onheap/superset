@@ -24,7 +24,7 @@ assists people when migrating to a new version.
 
 ## Next
 
-### Queries naming a CTE after a table they also read may now be rejected
+### Table reads masked by a same-named CTE are now row-level-security filtered
 
 `extract_tables_from_statement()` decided whether a reference was a CTE by matching its
 bare name against the enclosing scope's CTE names; it now resolves the name through
