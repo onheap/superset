@@ -298,11 +298,8 @@ class RLSAsPredicateTransformer(RLSTransformer):
         if not predicate:
             return node
 
-        # Qualify columns with the parsed alias node, not ``node.alias``: that property
-        # strips the quoting, and a string qualifier is emitted verbatim, so an alias
-        # holding SQL would land inside the predicate. ``FROM t AS (c1, c2)`` has no
-        # alias name at all; qualify with the table there, since an unqualified column
-        # could otherwise resolve against an enclosing scope.
+        # Qualify with the parsed alias node, not the ``node.alias`` string (which drops
+        # quoting and could inject SQL); use the table when the alias has no name.
         table_alias = node.args.get("alias")
         qualifier = (table_alias and table_alias.this) or node.this
         for column in predicate.find_all(exp.Column):
@@ -358,11 +355,8 @@ class RLSAsSubqueryTransformer(RLSTransformer):
 
         if predicate := self.get_predicate(node):
             if existing_alias := node.args.get("alias"):
-                # Carry the parsed node over rather than rebuilding from ``node.alias``:
-                # that property strips the quoting, and a string passed as ``alias=`` is
-                # emitted verbatim after ``AS``, so an alias holding SQL is re-emitted
-                # as SQL and appends an unfiltered branch. The node also carries the
-                # column alias list, so ``FROM t AS x (c1, c2)`` still renames columns.
+                # Reuse the parsed alias node, not the ``node.alias`` string: that drops
+                # quoting (SQL in an alias re-emits as SQL) and the column-alias list.
                 alias = existing_alias
             else:
                 # Use just the table name (not schema-qualified) so that
@@ -2009,29 +2003,15 @@ def extract_tables_from_statement(
 
 def is_cte(source: exp.Table, scope: Scope) -> bool:
     """
-    Does this reference resolve to a CTE rather than to a table?
+    Does this reference resolve to a CTE rather than to a real table?
 
-    A CTE reference is an ``exp.Table`` too, so it has to be excluded from the tables a
-    statement reads; otherwise a user with access to table `foo` could reach any table
-    with a query like this:
-
-        WITH foo AS (SELECT * FROM target_table) SELECT * FROM foo
-
-    The name is resolved through ``Scope.cte_sources`` rather than compared, because it
-    can match a CTE while the reference still resolves to a table: a qualified reference
-    cannot name a CTE, and nor can a ``WITH`` item's reference to itself or to a later
-    item unless ``RECURSIVE`` makes it legal. ``Scope.sources`` will not serve — keyed
-    by ``alias_or_name``, it files an aliased CTE reference under the alias, so a real
-    table sharing that alias would be taken for the CTE and dropped.
-
-    Where sqlglot registers a name differently than SQL scopes it, this errs toward
-    reporting a table: a reference differing from the CTE in letter case, and a
-    ``WITH RECURSIVE`` item's reference to itself or to a later item outside a
-    set-operation body. That costs an access check the statement does not need, and
-    where the engine treats the reference as the CTE it also has the rewrite apply the
-    rule to the CTE's projection, which the database rejects if the column is absent.
-    Erring the other way: a read in a recursive item's base term is legal and is not
-    reported.
+    A CTE reference is also an ``exp.Table``, so it must be excluded from a statement's
+    read tables, or a rule on a table could be evaded by wrapping it in a same-named
+    CTE. Resolve the name through ``Scope.cte_sources`` (not ``Scope.sources``, keyed by
+    ``alias_or_name``, which would hide a real table sharing a CTE's alias); a qualified
+    reference (schema or catalog) is always a table. Where sqlglot registers a name
+    differently than SQL scopes it (letter-case, a ``WITH RECURSIVE`` self/forward
+    reference), this errs toward reporting a table -- a spurious check, not a leak.
     """
     if source.db or source.catalog:
         return False
